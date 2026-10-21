@@ -1,4 +1,5 @@
 pub mod core;
+#[cfg(feature = "desktop-ui")]
 mod setup;
 
 use core::zip_archive::Archive;
@@ -52,7 +53,14 @@ mod ffi {
 }
 
 fn setup_data(title: &str, data_root: &str) -> Result<bool, core::CoreError> {
-    setup::run(title, data_root.as_ref())
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        return Ok(false);
+    }
+    #[cfg(feature = "desktop-ui")]
+    {
+        setup::run(title, data_root.as_ref())
+    }
 }
 
 fn bridge_smoke(value: &str) -> Result<String, core::CoreError> {

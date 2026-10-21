@@ -17,7 +17,12 @@ set(CORROSION_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(corrosion)
 
 get_filename_component(KZ_RUST_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/../Cargo.toml" ABSOLUTE)
-corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # iOS: build without the desktop GUI crates (eframe, rfd) which do not target iOS.
+    corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core)
+else()
+    corrosion_import_crate(MANIFEST_PATH ${KZ_RUST_MANIFEST} CRATES kazarov_core FEATURES desktop-ui)
+endif()
 find_program(KZ_FFMPEG_EXECUTABLE NAMES ffmpeg.exe ffmpeg HINTS "${KZ_FFMPEG_DIR}/bin")
 if(KZ_FFMPEG_EXECUTABLE)
     corrosion_set_env_vars(kazarov_core "KAZAROV_FFMPEG=${KZ_FFMPEG_EXECUTABLE}")
@@ -28,6 +33,13 @@ corrosion_add_cxxbridge(kazarov_bridge CRATE kazarov_core FILES rust/lib.rs)
 # additional OS dependencies when their static archive is linked from C++.
 if(WIN32)
     target_link_libraries(kazarov_core INTERFACE imm32 uxtheme opengl32 dwmapi)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # iOS: no AppKit/Carbon/OpenGL. Link the Apple frameworks the Rust stdlib and
+    # CXX bridge need; the game target already links UIKit/Metal/QuartzCore/CoreMotion/CoreGraphics.
+    target_link_libraries(kazarov_core INTERFACE
+        "-framework Foundation" "-framework CoreFoundation" "-framework CoreGraphics"
+        "-framework CoreMotion" "-framework QuartzCore" "-framework UIKit"
+        "-framework Metal" objc)
 elseif(APPLE)
     target_link_libraries(kazarov_core INTERFACE
         "-framework AppKit" "-framework Carbon" "-framework CoreFoundation" "-framework CoreGraphics"

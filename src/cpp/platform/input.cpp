@@ -23,6 +23,8 @@
 
 namespace {
 
+void ApplyTouch(InputPadState &state);
+
 enum class ActionKind {
     Button,
     HalfAxis,
@@ -207,6 +209,18 @@ float            g_touch_wheel = 0.0f;
 std::uint32_t    g_touch_held = 0;
 std::uint32_t    g_touch_tap = 0;
 bool             g_touch_tap_shown = false;
+
+// Screen touch state: active touches from SDL_FINGERDOWN/UP/MOTION events, used on iOS
+// and other touchscreen platforms to map touch to game actions.
+struct TouchPoint {
+    SDL_FingerID finger_id = 0;
+    float        x = 0.0f;   // normalized 0-1 across the screen
+    float        y = 0.0f;   // normalized 0-1 down the screen
+    bool         down = false;
+};
+constexpr int kMaxTouches = 10;
+std::array<TouchPoint, kMaxTouches> g_touch_points{};
+
 // Per host action: presses not yet consumed, and whether its non-key sources (mouse and gamepad
 // buttons, the script's keys) were held at the last poll, for their press edges.
 std::array<int, kHostActionCount>  g_host_presses{};
@@ -494,6 +508,9 @@ InputKeyboardMouse LiveKeyboardMouse() {
 void Compose(int pad) {
     g_state[pad] = pad == 0 ? InputApplyKeyboardMouse(g_device[pad], LiveKeyboardMouse()) : g_device[pad];
     InputPadState &state = g_state[pad];
+    if (pad == 0) {
+        ApplyTouch(state);
+    }
     if (pad == 0 && g_look_left && !Deflected(state.left_x) && !Deflected(state.left_y)) {
         state.left_x = state.right_x;
         state.left_y = state.right_y;
@@ -665,6 +682,43 @@ void SnapshotBind() {
     g_bind_pad = BindGamepadHeld();
 }
 
+// Touches on the left half of the screen act as a D-pad, touches on the right half as face
+// buttons: a quadrant split of each half maps to a direction or button.
+void ApplyTouch(InputPadState &state) {
+    for (const auto &tp : g_touch_points) {
+        if (!tp.down) {
+            continue;
+        }
+        if (tp.x < 0.5f) {
+            // Left side: D-pad. Split the left half into four quadrants.
+            const float dx = tp.x * 2.0f;   // 0..1 across the left half
+            const float dy = tp.y;          // 0..1 top to bottom
+            if (dx < 0.5f && dy < 0.5f) {
+                state.buttons |= kInputUp;
+            } else if (dx >= 0.5f && dy < 0.5f) {
+                state.buttons |= kInputRight;
+            } else if (dx < 0.5f && dy >= 0.5f) {
+                state.buttons |= kInputDown;
+            } else {
+                state.buttons |= kInputLeft;
+            }
+        } else {
+            // Right side: face buttons. Split into four quadrants.
+            const float dx = (tp.x - 0.5f) * 2.0f; // 0..1 across the right half
+            const float dy = tp.y;                 // 0..1 top to bottom
+            if (dx < 0.5f && dy < 0.5f) {
+                state.buttons |= kInputTriangle;
+            } else if (dx >= 0.5f && dy < 0.5f) {
+                state.buttons |= kInputCircle;
+            } else if (dx < 0.5f && dy >= 0.5f) {
+                state.buttons |= kInputCross;
+            } else {
+                state.buttons |= kInputSquare;
+            }
+        }
+    }
+}
+
 } // namespace
 
 void InputInit() {
@@ -746,6 +800,7 @@ void InputShutdown() {
     g_touch_held = g_touch_tap = 0;
     g_mouse_look = {0.0f, 0.0f, g_mouse_look.read};
     g_keys.fill(false);
+    g_touch_points.fill(TouchPoint{});
     g_scripted = {};
     g_scripted_wheel = 0.0f;
     g_host_presses.fill(0);
@@ -879,6 +934,37 @@ void InputHandleEvent(const SDL_Event &event) {
             g_menu_dx = 0.0f;
             g_menu_dy = 0.0f;
             break;
+        case SDL_EVENT_FINGER_DOWN: {
+            for (auto &tp : g_touch_points) {
+                if (!tp.down) {
+                    tp.finger_id = event.tfinger.fingerId;
+                    tp.x = event.tfinger.x;
+                    tp.y = event.tfinger.y;
+                    tp.down = true;
+                    break;
+                }
+            }
+            break;
+        }
+        case SDL_EVENT_FINGER_UP: {
+            for (auto &tp : g_touch_points) {
+                if (tp.down && tp.finger_id == event.tfinger.fingerId) {
+                    tp.down = false;
+                    break;
+                }
+            }
+            break;
+        }
+        case SDL_EVENT_FINGER_MOTION: {
+            for (auto &tp : g_touch_points) {
+                if (tp.down && tp.finger_id == event.tfinger.fingerId) {
+                    tp.x = event.tfinger.x;
+                    tp.y = event.tfinger.y;
+                    break;
+                }
+            }
+            break;
+        }
         default:
             break;
     }
