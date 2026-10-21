@@ -70,6 +70,13 @@ fs::path Installed(const char *name) {
         return *local / config.app_dir / name;
     }
 #endif
+#if defined(__APPLE__) && defined(__IPHONEOS__)
+    // iOS: app data lives in the Documents directory inside the app container,
+    // which is backed up and exposed to the Files app.
+    if (std::optional<fs::path> home = FromEnvironment("HOME")) {
+        return *home / "Documents" / config.app_dir / name;
+    }
+#endif
     if (std::optional<fs::path> xdg = FromEnvironment("XDG_DATA_HOME"); xdg && xdg->is_absolute()) {
         base = *xdg;
     } else if (std::optional<fs::path> home = FromEnvironment("HOME")) {
