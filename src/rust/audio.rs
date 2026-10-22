@@ -831,6 +831,7 @@ fn movie(b: &[u8]) -> CoreResult<Option<(Vec<u8>, Value)>> {
     )))
 }
 
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 fn movie_mp4(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1117,6 +1118,8 @@ pub fn convert_tree(raw: &Path, published: &Path, _jobs: usize) -> CoreResult<()
                 write(published_assets, &target, &stream(b)?)?;
                 streams.insert(key.clone(), Value::String(target));
             } else if key.ends_with(".pss") {
+                // An iOS app cannot start the FFmpeg command, so extracting on iOS leaves the movies out.
+                #[cfg(not(target_os = "ios"))]
                 movies.insert(key.clone(), movie_mp4(published_assets, key, b)?);
             }
             Ok(())
