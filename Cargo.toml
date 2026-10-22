@@ -25,7 +25,8 @@ zstd = { version = "0.14.2", default-features = false }
 libc = "0.2"
 
 [features]
-default = []
+# The desktop setup window; iOS builds without it.
+default = ["desktop-ui"]
 desktop-ui = ["dep:eframe", "dep:rfd"]
 
 [dev-dependencies]
