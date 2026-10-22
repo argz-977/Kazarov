@@ -134,6 +134,17 @@ void ReportFrameStats() {
              "longest {:.1f} ms",
              s.opened / seconds, seconds * 1000.0 / frames, s.fence_ms / frames, s.acquire_ms / frames,
              s.present_ms / frames, s.longest_frame_ms);
+    // Each zone's time since the last report, in milliseconds a second: how much of its thread the zone takes.
+    for (profile::ZoneTotals *zone = profile::zone_totals.load(std::memory_order_acquire); zone != nullptr;
+         zone = zone->next) {
+        const uint64_t calls = zone->calls.exchange(0, std::memory_order_relaxed);
+        const uint64_t nanoseconds = zone->nanoseconds.exchange(0, std::memory_order_relaxed);
+        if (calls > 0) {
+            kz::Logf(kz::LogLevel::Info, "gfx", "zone {}: {:.1f} ms a second, {:.0f} calls a second, {:.3f} ms a call",
+                     zone->name, static_cast<double>(nanoseconds) / 1e6 / seconds,
+                     static_cast<double>(calls) / seconds, static_cast<double>(nanoseconds) / 1e6 / calls);
+        }
+    }
     const auto last_open = s.last_open;
     g_frame_stats = {};
     g_frame_stats.last_open = last_open;
