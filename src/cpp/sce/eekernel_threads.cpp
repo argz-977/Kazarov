@@ -233,6 +233,26 @@ void RunEntry() {
 
 } // namespace
 
+std::size_t KzThreadsSnapshot(KzThreadInfo *out, std::size_t max) {
+    Scheduler  &s = Sched();
+    std::size_t count = 0;
+    for (const auto &[id, thread] : s.threads) {
+        if (count < max) {
+            KzThreadInfo &info = out[count];
+            info = {id, thread->priority, static_cast<int>(thread->state), thread->waiting_on, 0, 0};
+#if defined(__APPLE__) && defined(__aarch64__)
+            // A suspended context's registers, saved by swapcontext; the running thread's are stale.
+            if (thread.get() != s.running && thread->context.uc.uc_mcontext != nullptr) {
+                info.pc = static_cast<std::uintptr_t>(arm_thread_state64_get_pc(thread->context.uc.uc_mcontext->__ss));
+                info.fp = static_cast<std::uintptr_t>(arm_thread_state64_get_fp(thread->context.uc.uc_mcontext->__ss));
+            }
+#endif
+        }
+        ++count;
+    }
+    return count;
+}
+
 void KzThreadsSetMainPriority(int priority) {
     Scheduler &s = Sched();
     Thread    *main = FindThread(kMainThreadId);
