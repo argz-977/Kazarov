@@ -96,6 +96,13 @@ struct FrameStats {
     uint64_t recreate_failed = 0;
     int      last_present = 0;
     int      last_acquire = 0;
+    // Where the device thread's time went, in milliseconds: waiting for the GPU to finish an earlier frame, for
+    // a swapchain image and in present. Much of it in the fence wait means the GPU sets the pace; little, the CPU.
+    double   fence_ms = 0;
+    double   acquire_ms = 0;
+    double   present_ms = 0;
+    double   longest_frame_ms = 0;
+    std::chrono::steady_clock::time_point last_open{};
     std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
 };
 FrameStats g_frame_stats;
@@ -105,17 +112,30 @@ bool FrameStatsOn() {
     return on;
 }
 
+double MillisecondsSince(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 void ReportFrameStats() {
     if (!FrameStatsOn() || std::chrono::steady_clock::now() - g_frame_stats.since < std::chrono::seconds(5)) {
         return;
     }
     const FrameStats &s = g_frame_stats;
+    const double      frames = s.opened > 0 ? static_cast<double>(s.opened) : 1.0;
+    const double      seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s.since).count();
     kz::Logf(kz::LogLevel::Info, "gfx",
              "frame stats: {} opened, {} presented (last {}), {} acquires failed (last {}), {} swapchains made, {} "
              "failed, extent {}x{}",
              s.opened, s.presented, s.last_present, s.acquire_failed, s.last_acquire, s.recreated,
              s.recreate_failed, g.swapchain.extent.width, g.swapchain.extent.height);
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "frame times: {:.1f} fps, {:.2f} ms a frame, of which {:.2f} GPU fence, {:.2f} acquire, {:.2f} present; "
+             "longest {:.1f} ms",
+             s.opened / seconds, seconds * 1000.0 / frames, s.fence_ms / frames, s.acquire_ms / frames,
+             s.present_ms / frames, s.longest_frame_ms);
+    const auto last_open = s.last_open;
     g_frame_stats = {};
+    g_frame_stats.last_open = last_open;
 }
 
 // Waits for a fence as long as it takes, saying every few seconds that the GPU has not finished: a frame
@@ -761,7 +781,11 @@ void RunDeletions(Frame &frame) {
 void WaitFrame(Frame &frame) {
     KZ_PROFILE_ZONE("Kazarov WaitFrame");
     if (frame.pending) {
+        const auto start = std::chrono::steady_clock::now();
         WaitFence(frame.fence, "frame");
+        if (FrameStatsOn()) {
+            g_frame_stats.fence_ms += MillisecondsSince(start);
+        }
         frame.pending = false;
         HarvestDepthQueries(frame);
     }
@@ -1166,6 +1190,14 @@ bool OpenFrame() {
 #endif
     g.in_frame = true;
     g_frame_stats.opened++;
+    if (FrameStatsOn()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (g_frame_stats.last_open != std::chrono::steady_clock::time_point{}) {
+            g_frame_stats.longest_frame_ms =
+                std::max(g_frame_stats.longest_frame_ms, MillisecondsSince(g_frame_stats.last_open));
+        }
+        g_frame_stats.last_open = now;
+    }
     if (!tls.in_idle_hook) {
         g_game_frame_open.store(true);
     }
@@ -1187,8 +1219,12 @@ void FinishFrame() {
 bool AcquireImageOnce(bool targets, VkResult &result);
 
 bool AcquireImage(bool targets) {
-    VkResult result = VK_SUCCESS;
+    VkResult   result = VK_SUCCESS;
+    const auto start = std::chrono::steady_clock::now();
     const bool acquired = AcquireImageOnce(targets, result);
+    if (FrameStatsOn()) {
+        g_frame_stats.acquire_ms += MillisecondsSince(start);
+    }
     if (!acquired) {
         g_frame_stats.acquire_failed++;
         g_frame_stats.last_acquire = static_cast<int>(result);
@@ -1274,7 +1310,11 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
     present.swapchainCount = 1;
     present.pSwapchains = &g.swapchain.handle;
     present.pImageIndices = &g.image_index;
-    VkResult result = vkQueuePresentKHR(g.queue, &present);
+    const auto present_start = std::chrono::steady_clock::now();
+    VkResult   result = vkQueuePresentKHR(g.queue, &present);
+    if (FrameStatsOn()) {
+        g_frame_stats.present_ms += MillisecondsSince(present_start);
+    }
     g_frame_stats.presented++;
     g_frame_stats.last_present = static_cast<int>(result);
     if (result == VK_SUBOPTIMAL_KHR) {
