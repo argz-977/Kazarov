@@ -3074,7 +3074,9 @@ pub(crate) struct ExternalMotion {
 }
 
 /// Motion channels kept compressed while they wait for placement: as JSON values the disc's external motions
-/// take several hundred megabytes, which every model job of the pass would otherwise hold.
+/// take several hundred megabytes, which every model job of the pass would otherwise hold. They are encoded in
+/// binary, not as JSON text: serde_json does not read every float back to the bits it wrote, and the published
+/// keys must not change.
 #[derive(Clone)]
 pub(crate) struct PackedChannels {
     bytes: Vec<u8>,
@@ -3083,7 +3085,8 @@ pub(crate) struct PackedChannels {
 
 impl PackedChannels {
     fn new(channels: &[Value]) -> CoreResult<Self> {
-        let encoded = serde_json::to_vec(channels)?;
+        let mut encoded = Vec::new();
+        encode_value_list(channels, &mut encoded);
         let mut bytes = zstd::bulk::compress(&encoded, 1)?;
         bytes.shrink_to_fit();
         Ok(Self {
@@ -3096,7 +3099,99 @@ impl PackedChannels {
     fn values(&self) -> Vec<Value> {
         let decoded = zstd::bulk::decompress(&self.bytes, self.decoded_len)
             .expect("packed motion channels decompress");
-        serde_json::from_slice(&decoded).expect("packed motion channels parse")
+        let mut at = 0;
+        decode_value_list(&decoded, &mut at)
+    }
+}
+
+fn encode_len(length: usize, out: &mut Vec<u8>) {
+    out.extend((length as u64).to_le_bytes());
+}
+
+fn encode_value_list(values: &[Value], out: &mut Vec<u8>) {
+    encode_len(values.len(), out);
+    for value in values {
+        encode_value(value, out);
+    }
+}
+
+fn encode_value(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Null => out.push(0),
+        Value::Bool(flag) => out.push(if *flag { 2 } else { 1 }),
+        Value::Number(number) => {
+            if let Some(unsigned) = number.as_u64() {
+                out.push(3);
+                out.extend(unsigned.to_le_bytes());
+            } else if let Some(signed) = number.as_i64() {
+                out.push(4);
+                out.extend(signed.to_le_bytes());
+            } else {
+                out.push(5);
+                out.extend(number.as_f64().unwrap_or(0.0).to_bits().to_le_bytes());
+            }
+        }
+        Value::String(text) => {
+            out.push(6);
+            encode_len(text.len(), out);
+            out.extend(text.as_bytes());
+        }
+        Value::Array(values) => {
+            out.push(7);
+            encode_value_list(values, out);
+        }
+        Value::Object(map) => {
+            out.push(8);
+            encode_len(map.len(), out);
+            for (key, value) in map {
+                encode_len(key.len(), out);
+                out.extend(key.as_bytes());
+                encode_value(value, out);
+            }
+        }
+    }
+}
+
+fn decode_u64(bytes: &[u8], at: &mut usize) -> u64 {
+    let value = u64::from_le_bytes(bytes[*at..*at + 8].try_into().unwrap());
+    *at += 8;
+    value
+}
+
+fn decode_text(bytes: &[u8], at: &mut usize) -> String {
+    let length = decode_u64(bytes, at) as usize;
+    let text = std::str::from_utf8(&bytes[*at..*at + length]).unwrap().to_owned();
+    *at += length;
+    text
+}
+
+fn decode_value_list(bytes: &[u8], at: &mut usize) -> Vec<Value> {
+    let count = decode_u64(bytes, at) as usize;
+    (0..count).map(|_| decode_value(bytes, at)).collect()
+}
+
+fn decode_value(bytes: &[u8], at: &mut usize) -> Value {
+    let tag = bytes[*at];
+    *at += 1;
+    match tag {
+        0 => Value::Null,
+        1 => Value::Bool(false),
+        2 => Value::Bool(true),
+        3 => Value::from(decode_u64(bytes, at)),
+        4 => Value::from(decode_u64(bytes, at) as i64),
+        5 => serde_json::Number::from_f64(f64::from_bits(decode_u64(bytes, at)))
+            .map_or(Value::Null, Value::Number),
+        6 => Value::String(decode_text(bytes, at)),
+        7 => Value::Array(decode_value_list(bytes, at)),
+        _ => {
+            let count = decode_u64(bytes, at) as usize;
+            let mut map = serde_json::Map::new();
+            for _ in 0..count {
+                let key = decode_text(bytes, at);
+                map.insert(key, decode_value(bytes, at));
+            }
+            Value::Object(map)
+        }
     }
 }
 
@@ -6952,6 +7047,21 @@ mod tests {
             linked_copy_candidates(&motions, &placements, &selected, "event/orphan/foo.gltf");
         assert_eq!(copies, BTreeSet::from([1, 2]));
         assert_eq!(names, vec![motions[0].key.clone(), motions[1].key.clone()]);
+    }
+
+    #[test]
+    fn packed_channels_keep_every_float_bit() {
+        let channels = vec![json!({
+            "type": 0,
+            "keys": [{"time": 3, "value": [2.3493103981018066, -1.2722920179367065, 0.48843714594841003]}],
+            "name": "frame", "flag": true, "none": null, "offset": -7
+        })];
+        let packed = PackedChannels::new(&channels).unwrap();
+        assert_eq!(packed.values(), channels);
+        assert_eq!(
+            serde_json::to_vec(&packed.values()).unwrap(),
+            serde_json::to_vec(&channels).unwrap()
+        );
     }
 
     #[test]
