@@ -85,6 +85,23 @@ namespace {
 
 VkCommandPool g_oneshot_pool = VK_NULL_HANDLE;
 
+// Waits for a fence as long as it takes, saying every few seconds that the GPU has not finished: a frame
+// that never completes otherwise stops the game with nothing in the log.
+void WaitFence(VkFence fence, const char *what) {
+    constexpr uint64_t kReportNanoseconds = 5'000'000'000;
+    for (int waited = 0;; waited += 5) {
+        VkResult result = vkWaitForFences(g.device, 1, &fence, VK_TRUE, kReportNanoseconds);
+        if (result != VK_TIMEOUT) {
+            Check(result, "vkWaitForFences");
+            if (waited > 0) {
+                kz::Logf(kz::LogLevel::Warning, "gfx", "{}: the GPU finished after {}+ s", what, waited);
+            }
+            return;
+        }
+        kz::Logf(kz::LogLevel::Warning, "gfx", "{}: the GPU has not finished after {} s", what, waited + 5);
+    }
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
                                              VkDebugUtilsMessageTypeFlagsEXT             types,
                                              const VkDebugUtilsMessengerCallbackDataEXT *data, void *) {
@@ -709,7 +726,7 @@ void RunDeletions(Frame &frame) {
 void WaitFrame(Frame &frame) {
     KZ_PROFILE_ZONE("Kazarov WaitFrame");
     if (frame.pending) {
-        Check(vkWaitForFences(g.device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        WaitFence(frame.fence, "frame");
         frame.pending = false;
         HarvestDepthQueries(frame);
     }
@@ -871,7 +888,7 @@ void RunOneShot(const std::function<void(VkCommandBuffer)> &record) {
     submit.commandBufferInfoCount = 1;
     submit.pCommandBufferInfos = &command;
     Check(vkQueueSubmit2(g.queue, 1, &submit, fence), "vkQueueSubmit2");
-    Check(vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    WaitFence(fence, "one-shot submission");
     // Synchronous readback completes earlier submissions; publish their depth answers oldest first.
     for (uint32_t frame_offset = 1; frame_offset <= kFramesInFlight; ++frame_offset) {
         WaitFrame(g.frames[(g.frame_slot + frame_offset) % kFramesInFlight]);
