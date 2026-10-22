@@ -14,11 +14,16 @@
 
 namespace {
 
-// Android shows the window fullscreen at the display's size, whatever is asked.
-#ifdef __ANDROID__
+// Android and iOS show the window fullscreen at the display's size, whatever is asked.
+#if defined(__ANDROID__) || defined(SDL_PLATFORM_IOS)
 constexpr bool kFixedWindow = true;
 #else
 constexpr bool kFixedWindow = false;
+#endif
+#ifdef SDL_PLATFORM_IOS
+constexpr bool kIos = true;
+#else
+constexpr bool kIos = false;
 #endif
 
 SDL_Window                              *g_window = nullptr;
@@ -80,7 +85,8 @@ void WindowSetIdentity(const WindowIdentity &identity) { g_identity = identity; 
 
 void WindowInit(const WindowConfig &config) {
     SDL_SetAppMetadata(g_identity.title, nullptr, g_identity.app_id);
-#ifdef __ANDROID__
+    // Also on iOS, where a host such as LiveContainer may not carry the app's own Info.plist orientations.
+#if defined(__ANDROID__) || defined(SDL_PLATFORM_IOS)
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #endif
     g_headless = config.headless;
@@ -106,7 +112,8 @@ void WindowInit(const WindowConfig &config) {
 #endif
     }
     Placement placement = Place(config, SDL_GetPrimaryDisplay());
-    if (placement.fullscreen) {
+    // An iOS window takes the whole display whatever is placed; fullscreen also hides the status bar.
+    if (placement.fullscreen || kIos) {
         flags |= SDL_WINDOW_FULLSCREEN;
     }
     SDL_PropertiesID props = SDL_CreateProperties();
