@@ -28,6 +28,8 @@ pub mod packs;
 pub mod progress;
 #[path = "publish.rs"]
 pub mod publish;
+#[path = "spill.rs"]
+pub(crate) mod spill;
 #[path = "textures.rs"]
 pub mod textures;
 #[path = "zip_archive.rs"]
