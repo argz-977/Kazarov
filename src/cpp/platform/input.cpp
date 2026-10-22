@@ -937,7 +937,7 @@ void InputHandleEvent(const SDL_Event &event) {
         case SDL_EVENT_FINGER_DOWN: {
             for (auto &tp : g_touch_points) {
                 if (!tp.down) {
-                    tp.finger_id = event.tfinger.fingerId;
+                    tp.finger_id = event.tfinger.fingerID;
                     tp.x = event.tfinger.x;
                     tp.y = event.tfinger.y;
                     tp.down = true;
@@ -948,7 +948,7 @@ void InputHandleEvent(const SDL_Event &event) {
         }
         case SDL_EVENT_FINGER_UP: {
             for (auto &tp : g_touch_points) {
-                if (tp.down && tp.finger_id == event.tfinger.fingerId) {
+                if (tp.down && tp.finger_id == event.tfinger.fingerID) {
                     tp.down = false;
                     break;
                 }
@@ -957,7 +957,7 @@ void InputHandleEvent(const SDL_Event &event) {
         }
         case SDL_EVENT_FINGER_MOTION: {
             for (auto &tp : g_touch_points) {
-                if (tp.down && tp.finger_id == event.tfinger.fingerId) {
+                if (tp.down && tp.finger_id == event.tfinger.fingerID) {
                     tp.x = event.tfinger.x;
                     tp.y = event.tfinger.y;
                     break;
