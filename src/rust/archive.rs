@@ -261,7 +261,7 @@ fn open_image_bytes(image: &Path, bytes: &[u8]) -> CoreResult<Archive> {
 }
 
 fn open_image(image: &Path) -> CoreResult<Archive> {
-    open_image_bytes(image, &fs::read(image)?)
+    open_image_bytes(image, SourceBytes::open_iso(image)?.bytes())
 }
 
 fn directory_file(root: &Path, name: &str) -> CoreResult<Extent> {
@@ -490,9 +490,21 @@ pub struct SourceTree {
 
 /// Bytes owned for the lifetime of all references into one source file.
 #[derive(Clone)]
-pub struct SourceBytes(pub Arc<Vec<u8>>);
+pub struct SourceBytes(Arc<SourceData>);
+
+enum SourceData {
+    Owned(Vec<u8>),
+    /// iOS holds a whole disc image only mapped: read into memory, its 4.7 GB is far past what the system lets
+    /// an app keep, and the system ends the app. The mapping's pages come from the file and go back to it.
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    Mapped(memmap2::Mmap),
+}
 
 impl SourceBytes {
+    pub fn owned(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(SourceData::Owned(bytes)))
+    }
+
     /// Reads an ISO once and shares its immutable buffer with all converters.
     pub fn open_iso(path: &Path) -> CoreResult<Self> {
         Self::open_iso_with_progress(path, &Phase::noop())
@@ -503,6 +515,18 @@ impl SourceBytes {
         let length = usize::try_from(file.metadata()?.len())
             .map_err(|_| error("ISO exceeds addressable memory"))?;
         phase.set_total(length as u64);
+        #[cfg(target_os = "ios")]
+        {
+            // SAFETY: the mapping is read-only, and the player does not change the disc image during extraction;
+            // a changed size is reported below as for the read.
+            let map = unsafe { memmap2::Mmap::map(&file) }?;
+            if map.len() != length {
+                return Err(error("ISO changed size while being read"));
+            }
+            phase.inc(length as u64);
+            phase.add_bytes(length as u64);
+            return Ok(Self(Arc::new(SourceData::Mapped(map))));
+        }
         let mut bytes = Vec::with_capacity(length);
         let mut chunk = vec![0u8; CHUNK];
         loop {
@@ -517,11 +541,14 @@ impl SourceBytes {
         if bytes.len() != length {
             return Err(error("ISO changed size while being read"));
         }
-        Ok(Self(Arc::new(bytes)))
+        Ok(Self::owned(bytes))
     }
 
     pub fn bytes(&self) -> &[u8] {
-        self.0.as_slice()
+        match &*self.0 {
+            SourceData::Owned(bytes) => bytes,
+            SourceData::Mapped(map) => map,
+        }
     }
 }
 
@@ -535,7 +562,7 @@ pub struct ResourceRef {
 
 impl ResourceRef {
     pub fn bytes(&self) -> &[u8] {
-        &self.source.0[self.range.clone()]
+        &self.source.bytes()[self.range.clone()]
     }
 
     pub fn len(&self) -> usize {
@@ -606,7 +633,7 @@ impl SourceTree {
             let source_bytes = if let Some(image) = &image {
                 image.clone()
             } else {
-                SourceBytes(Arc::new(item.extent.read()?))
+                SourceBytes::owned(item.extent.read()?)
             };
             let start =
                 usize::try_from(item.extent.offset).map_err(|_| error("source offset overflow"))?;
@@ -678,7 +705,7 @@ impl SourceTree {
         let bytes = entries.values().map(|entry| entry.size).sum();
         let mut resources = BTreeMap::new();
         for (name, extent) in &entries {
-            let bytes = SourceBytes(Arc::new(extent.read()?));
+            let bytes = SourceBytes::owned(extent.read()?);
             resources.insert(
                 name.clone(),
                 ResourceRef {
