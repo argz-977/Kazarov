@@ -38,7 +38,7 @@ function(kz_port_host_library target)
     endif()
     if(NOT TARGET Vulkan::Vulkan)
         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-            # iOS: MoltenVK implements Vulkan over Metal. Find headers and library directly.
+            # iOS has no Vulkan loader: MoltenVK implements Vulkan over Metal and links in statically.
             find_path(Vulkan_INCLUDE_DIR NAMES vulkan/vulkan.h)
             find_library(Vulkan_LIBRARY NAMES MoltenVK)
             if(Vulkan_INCLUDE_DIR AND Vulkan_LIBRARY)
@@ -121,17 +121,6 @@ function(kz_port_host_library target)
     if(WIN32)
         # platform/game_icon.cpp's shortcut beside the executable (IShellLinkW).
         target_link_libraries(${target} PUBLIC ole32 uuid)
-    endif()
-    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-        # iOS: Vulkan is provided by MoltenVK on top of Metal. Link MoltenVK so the
-        # Vulkan loader can resolve MoltenVK's ICD at runtime.
-        find_package(MoltenVK QUIET)
-        if(NOT TARGET MoltenVK::MoltenVK)
-            find_library(_molten_vk_lib NAMES MoltenVK)
-            if(_molten_vk_lib)
-                target_link_libraries(${target} PRIVATE "${_molten_vk_lib}")
-            endif()
-        endif()
     endif()
     target_compile_options(${target} PRIVATE -Wall -ffunction-sections -fdata-sections)
     # arm64 clang fuses a*b+c into one rounding and x86-64 has no FMA in its baseline. The logical-to-pixel
