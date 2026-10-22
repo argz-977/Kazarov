@@ -250,8 +250,8 @@ bool ParseSource(std::string_view name, ActionKind kind, Source &source) {
         std::size_t star = text.find('*');
         if (star != std::string_view::npos) {
             std::string_view factor = Trim(text.substr(star + 1));
-#ifdef __ANDROID__
-            // Android's libc++ has no floating-point from_chars.
+#if defined(__ANDROID__) || defined(SDL_PLATFORM_IOS)
+            // Android's libc++ has no floating-point from_chars, and iOS's has it only from iOS 26.
             std::string factor_text(factor);
             char       *end = nullptr;
             scale = std::strtof(factor_text.c_str(), &end);

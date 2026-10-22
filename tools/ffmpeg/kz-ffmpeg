@@ -30,7 +30,7 @@ LICENSE_LINE = 'License: LGPL version 2.1 or later'
 STAMP = 'kz-ffmpeg.json'
 LIBRARIES = ('lib/libavcodec.a', 'lib/libavformat.a', 'lib/libavutil.a',
              'lib/libswresample.a', 'lib/libswscale.a', 'include/libavcodec/avcodec.h')
-IOS_MIN_VERSION = '15.0'
+IOS_MIN_VERSION = '18.0'
 CONFIGURE_FLAGS = [
     '--disable-everything',
     '--disable-programs',
