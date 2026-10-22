@@ -390,6 +390,14 @@ void PickPhysicalDevice() {
     if (std::vector<std::string> workarounds = PortabilityWorkarounds(chosen); !workarounds.empty()) {
         kz::Logf(kz::LogLevel::Info, "Vulkan", "portability subset: {}", Join(workarounds));
     }
+    std::vector<std::string> bindless_missing = MissingBindless(chosen);
+    // Turning the array off where it works is only for testing, and needs push descriptors.
+    g.bindless = bindless_missing.empty() &&
+                 (g.config.bindless_textures || !HasExtension(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME));
+    if (!g.bindless) {
+        kz::Logf(kz::LogLevel::Info, "Vulkan", "each draw pushes its textures: {}",
+                 bindless_missing.empty() ? std::string("bindless textures turned off") : Join(bindless_missing));
+    }
 }
 
 bool DepthStencilUsable(VkFormat format) {
@@ -457,16 +465,16 @@ void CreateDevice() {
     VkPhysicalDeviceVulkan12Features features12 = {};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     features12.pNext = &features13;
-    features12.descriptorBindingPartiallyBound = VK_TRUE;
-    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
-    features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    features12.descriptorBindingPartiallyBound = g.bindless;
+    features12.descriptorBindingSampledImageUpdateAfterBind = g.bindless;
+    features12.descriptorBindingUpdateUnusedWhilePending = g.bindless;
 
     VkPhysicalDeviceFeatures2 features = {};
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features.pNext = &features12;
     features.features.dualSrcBlend = VK_TRUE;
     features.features.shaderClipDistance = VK_TRUE;
-    features.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    features.features.shaderSampledImageArrayDynamicIndexing = g.bindless;
     VkPhysicalDeviceFeatures supported = {};
     vkGetPhysicalDeviceFeatures(g.physical_device, &supported);
     g.sampler_anisotropy = supported.samplerAnisotropy == VK_TRUE;
@@ -481,6 +489,9 @@ void CreateDevice() {
     }
     if (g.portability_subset) {
         extensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
+    if (!g.bindless) {
+        extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     }
 
     VkDeviceCreateInfo info = {};
@@ -499,6 +510,14 @@ void CreateDevice() {
         g.cmd_set_color_write_mask = reinterpret_cast<PFN_vkCmdSetColorWriteMaskEXT>(
             vkGetDeviceProcAddr(g.device, "vkCmdSetColorWriteMaskEXT"));
         g.dynamic_color_write_mask = g.cmd_set_color_write_mask != nullptr;
+    }
+    if (!g.bindless) {
+        g.cmd_push_descriptor_set = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
+            vkGetDeviceProcAddr(g.device, "vkCmdPushDescriptorSetKHR"));
+        if (g.cmd_push_descriptor_set == nullptr) {
+            Fatal("%s offers %s without vkCmdPushDescriptorSetKHR", g.properties.deviceName,
+                  VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+        }
     }
 }
 
@@ -1037,6 +1056,10 @@ void CreateMainTargets() {
     VkDescriptorImageInfo images[2];
     for (uint32_t i = 0; i < 2; i++) {
         images[i] = {VK_NULL_HANDLE, g.main_color[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        g.texture_views[kMainTarget + i] = g.main_color[i].view;
+    }
+    if (!g.bindless) {
+        return;
     }
     VkWriteDescriptorSet write = {};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1103,11 +1126,15 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
             Error("KZ_RENDER_THREAD=%s is not off, lockstep or async", setting);
         }
     }
+    if (const char *setting = std::getenv("KZ_BINDLESS"); setting != nullptr && std::strcmp(setting, "0") == 0) {
+        g.config.bindless_textures = false;
+    }
 #ifdef __ANDROID__
     g.config.render_thread = RenderThreadMode::Off;
 #endif
     g.texture_slot_limit = config.texture_slots == 0 ? kMaxTextures : std::min(config.texture_slots, kMaxTextures);
     g.mesh_slot_limit = config.mesh_slots == 0 ? kMaxMeshes : std::min(config.mesh_slots, kMaxMeshes);
+    g.texture_views.assign(g.texture_slot_limit, VK_NULL_HANDLE);
     g.offscreen = config.offscreen;
     g.layout = config.layout;
     CreateInstance();
@@ -1596,7 +1623,7 @@ bool InFrame() { return GameFrameOpen() || RecordingCalls(); }
 
 RendererFeatures ActiveRendererFeatures() {
     return {g.properties.apiVersion, g.offscreen, g.triangle_fans, g.separate_stencil_masks,
-            g.dynamic_color_write_mask, g.portability_subset};
+            g.dynamic_color_write_mask, g.portability_subset, g.bindless};
 }
 
 bool HeadlessSurfaceAvailable() { return InstanceHasExtension(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME); }
