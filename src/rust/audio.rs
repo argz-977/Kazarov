@@ -831,9 +831,7 @@ fn movie(b: &[u8]) -> CoreResult<Option<(Vec<u8>, Value)>> {
     )))
 }
 
-#[cfg_attr(target_os = "ios", allow(dead_code))]
 fn movie_mp4(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
-    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SERIAL: AtomicU64 = AtomicU64::new(0);
     struct Temporary(std::path::PathBuf);
@@ -861,6 +859,18 @@ fn movie_mp4(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
         .trim_end_matches(".pss");
     let target = format!("movie/{name}.mp4");
     fs::create_dir_all(root.join(&target).parent().unwrap())?;
+    convert_movie(
+        &video,
+        audio.is_some().then_some(audio_path.as_path()),
+        &root.join(&target),
+    )?;
+    Ok(target)
+}
+
+/// Copies the MPEG-2 video and encodes the PCM audio as ALAC into an MP4, with the FFmpeg command.
+#[cfg(not(target_os = "ios"))]
+fn convert_movie(video: &Path, audio: Option<&Path>, output: &Path) -> CoreResult<()> {
+    use std::process::Command;
     let sibling = std::env::current_exe().ok().and_then(|p| {
         p.parent().map(|p| {
             p.join(if cfg!(windows) {
@@ -896,9 +906,9 @@ fn movie_mp4(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
             "-start_at_zero",
             "-i",
         ])
-        .arg(&video);
-    if audio.is_some() {
-        command.arg("-i").arg(&audio_path);
+        .arg(video);
+    if let Some(audio) = audio {
+        command.arg("-i").arg(audio);
     }
     command.args(["-map", "0:v:0"]);
     if audio.is_some() {
@@ -921,7 +931,7 @@ fn movie_mp4(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
             "-f",
             "mp4",
         ])
-        .arg(root.join(&target));
+        .arg(output);
     let result = command.output().map_err(|e| {
         fail(format!(
             "{}: movie MP4 conversion requires FFmpeg: {e}",
@@ -934,7 +944,48 @@ fn movie_mp4(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
             String::from_utf8_lossy(&result.stderr)
         )));
     }
-    Ok(target)
+    Ok(())
+}
+
+/// An iOS app cannot start the FFmpeg command, so the game converts with FFmpeg's libraries in process: the
+/// executable that links kazarov_core on iOS defines kz_movie_mp4, with the command's output.
+#[cfg(target_os = "ios")]
+fn convert_movie(video: &Path, audio: Option<&Path>, output: &Path) -> CoreResult<()> {
+    use std::ffi::{CStr, CString, c_char, c_int};
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn kz_movie_mp4(
+            video: *const c_char,
+            audio: *const c_char,
+            output: *const c_char,
+            error: *mut c_char,
+            error_size: usize,
+        ) -> c_int;
+    }
+    let c_path = |path: &Path| {
+        CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| fail(format!("{}: path holds a NUL byte", path.display())))
+    };
+    let video = c_path(video)?;
+    let audio = audio.map(c_path).transpose()?;
+    let output = c_path(output)?;
+    let mut error = [0 as c_char; 512];
+    // SAFETY: every path is a NUL-terminated string that outlives the call, and error is writable for its length.
+    let status = unsafe {
+        kz_movie_mp4(
+            video.as_ptr(),
+            audio.as_ref().map_or(std::ptr::null(), |a| a.as_ptr()),
+            output.as_ptr(),
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if status != 0 {
+        // SAFETY: kz_movie_mp4 leaves a NUL-terminated message in error on failure.
+        let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+        return Err(fail(format!("FFmpeg MP4 conversion failed: {message}")));
+    }
+    Ok(())
 }
 
 fn pack(b: &[u8]) -> Option<Vec<(String, &[u8])>> {
@@ -1118,8 +1169,6 @@ pub fn convert_tree(raw: &Path, published: &Path, _jobs: usize) -> CoreResult<()
                 write(published_assets, &target, &stream(b)?)?;
                 streams.insert(key.clone(), Value::String(target));
             } else if key.ends_with(".pss") {
-                // An iOS app cannot start the FFmpeg command, so extracting on iOS leaves the movies out.
-                #[cfg(not(target_os = "ios"))]
                 movies.insert(key.clone(), movie_mp4(published_assets, key, b)?);
             }
             Ok(())
