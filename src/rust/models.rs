@@ -165,6 +165,88 @@ struct Resource {
     alias: String,
     data: Vec<u8>,
 }
+
+/// A file's discovered resources. Every analysed file waits with the others until all are analysed, so their
+/// copies are kept zstd-packed meanwhile, as its model artifacts are, and unpacked by the job that publishes it.
+enum ResourceStore {
+    Plain(Vec<Resource>),
+    Packed {
+        first_alias: Option<String>,
+        data_len: usize,
+        decoded_len: usize,
+        bytes: Vec<u8>,
+    },
+}
+
+impl ResourceStore {
+    fn pack(&mut self) -> CoreResult<()> {
+        let Self::Plain(resources) = self else {
+            return Ok(());
+        };
+        let mut encoded = Vec::new();
+        for resource in resources.iter() {
+            encoded.extend((resource.alias.len() as u64).to_le_bytes());
+            encoded.extend(resource.alias.as_bytes());
+            encoded.extend((resource.data.len() as u64).to_le_bytes());
+            encoded.extend(&resource.data);
+        }
+        let mut bytes = zstd::bulk::compress(&encoded, 1)?;
+        bytes.shrink_to_fit();
+        *self = Self::Packed {
+            first_alias: resources.first().map(|resource| resource.alias.clone()),
+            data_len: resources.iter().map(|resource| resource.data.len()).sum(),
+            decoded_len: encoded.len(),
+            bytes,
+        };
+        Ok(())
+    }
+
+    fn load(&self) -> CoreResult<std::borrow::Cow<'_, [Resource]>> {
+        let (decoded_len, bytes) = match self {
+            Self::Plain(resources) => return Ok(std::borrow::Cow::Borrowed(resources)),
+            Self::Packed {
+                decoded_len, bytes, ..
+            } => (*decoded_len, bytes),
+        };
+        let decoded = zstd::bulk::decompress(bytes, decoded_len)?;
+        fn take<'a>(decoded: &'a [u8], at: &mut usize, count: usize) -> CoreResult<&'a [u8]> {
+            let end = at
+                .checked_add(count)
+                .ok_or_else(|| fail("packed model resources are truncated"))?;
+            let slice = decoded
+                .get(*at..end)
+                .ok_or_else(|| fail("packed model resources are truncated"))?;
+            *at = end;
+            Ok(slice)
+        }
+        let length = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap()) as usize;
+        let mut at = 0;
+        let mut resources = Vec::new();
+        while at < decoded.len() {
+            let alias_len = length(take(&decoded, &mut at, 8)?);
+            let alias = String::from_utf8(take(&decoded, &mut at, alias_len)?.to_vec())
+                .map_err(|_| fail("packed model resource alias is not UTF-8"))?;
+            let data_len = length(take(&decoded, &mut at, 8)?);
+            let data = take(&decoded, &mut at, data_len)?.to_vec();
+            resources.push(Resource { alias, data });
+        }
+        Ok(std::borrow::Cow::Owned(resources))
+    }
+
+    fn first_alias(&self) -> Option<&str> {
+        match self {
+            Self::Plain(resources) => resources.first().map(|resource| resource.alias.as_str()),
+            Self::Packed { first_alias, .. } => first_alias.as_deref(),
+        }
+    }
+
+    fn data_len(&self) -> usize {
+        match self {
+            Self::Plain(resources) => resources.iter().map(|resource| resource.data.len()).sum(),
+            Self::Packed { data_len, .. } => *data_len,
+        }
+    }
+}
 #[derive(Clone)]
 pub(crate) struct Member {
     pub(crate) name: String,
@@ -2530,7 +2612,10 @@ impl NativeArtifact {
             return Ok(());
         }
         let encoded = serde_json::to_vec(&(&self.gltf, &self.metadata, &self.animations))?;
-        let packed = zstd::bulk::compress(&encoded, 1)?;
+        let mut packed = zstd::bulk::compress(&encoded, 1)?;
+        // compress reserves the worst-case compressed size, about the encoded size; a packed artifact waits
+        // for publication with its file's others, so the spare capacity would be held for every model.
+        packed.shrink_to_fit();
         self.gltf = Value::Null;
         self.metadata = Value::Null;
         self.animations.clear();
@@ -4311,11 +4396,12 @@ struct FileAnalysis {
     models: Vec<ModelOutput>,
     standalone: Vec<(String, Standalone)>,
     used_textures: BTreeSet<String>,
-    resources: Vec<Resource>,
+    resources: ResourceStore,
 }
 
 impl FileAnalysis {
     fn pack_artifacts(&mut self) -> CoreResult<()> {
+        self.resources.pack()?;
         for model in &mut self.models {
             model.artifact.pack()?;
         }
@@ -4743,13 +4829,13 @@ fn analyze_file(
         models,
         standalone,
         used_textures,
-        resources,
+        resources: ResourceStore::Plain(resources),
     }))
 }
 
 /// Native publication of one committed file, with the report entries its commit produced.
 struct NativeJob {
-    resources: Vec<Resource>,
+    resources: ResourceStore,
     artifacts: BTreeMap<String, NativeArtifact>,
     icons: Vec<MemoryCardIcon>,
     files: Vec<String>,
@@ -4758,12 +4844,7 @@ struct NativeJob {
 
 impl NativeJob {
     fn estimated_expanded_bytes(&self) -> usize {
-        let source = self
-            .resources
-            .iter()
-            .map(|resource| resource.data.len())
-            .sum::<usize>()
-            .saturating_mul(4);
+        let source = self.resources.data_len().saturating_mul(4);
         let decoded = self
             .artifacts
             .values()
@@ -4912,7 +4993,7 @@ fn commit_file(
         }
         converted.insert(alias);
     }
-    converted.extend(native_claims(&analysis.resources));
+    converted.extend(native_claims(&analysis.resources.load()?));
     Ok(Some(NativeJob {
         resources: analysis.resources,
         artifacts,
@@ -4936,7 +5017,7 @@ fn publish_jobs(
         let mut local = ConversionReport::default();
         publish_native(
             published,
-            &job.resources,
+            &job.resources.load()?,
             &job.artifacts,
             documents,
             &mut local,
@@ -5053,7 +5134,7 @@ impl ModelPlan {
                         };
                         publish_native_impl(
                             Path::new("published"),
-                            &job.resources,
+                            &job.resources.load()?,
                             &job.artifacts,
                             &documents,
                             &mut local,
@@ -5063,20 +5144,14 @@ impl ModelPlan {
                         if elapsed.as_secs() >= 1
                             && std::env::var_os("DC2DATA_PROFILE_JOBS").is_some()
                         {
-                            let label = job
-                                .resources
-                                .first()
-                                .map_or("model-job", |resource| resource.alias.as_str());
+                            let label = job.resources.first_alias().unwrap_or("model-job");
                             eprintln!("dc2data job preview {label}: {:.3}s", elapsed.as_secs_f64());
                         }
                         Ok((pairs.into_keys().collect(), local, elapsed))
                     })?;
                     let work = preview_work[index];
                     sink.complete(work)?;
-                    let label = job
-                        .resources
-                        .first()
-                        .map_or("", |resource| resource.alias.as_str());
+                    let label = job.resources.first_alias().unwrap_or("");
                     on_preview(work, label);
                     Ok(result)
                 })
@@ -5162,10 +5237,10 @@ impl ModelPlan {
             let owners = owners.clone();
             let external_work = external_work.clone();
             let external_targets = external_targets.clone();
-            let label = job.resources.first().map_or_else(
-                || format!("model-job-{index}"),
-                |resource| resource.alias.clone(),
-            );
+            let label = job
+                .resources
+                .first_alias()
+                .map_or_else(|| format!("model-job-{index}"), str::to_owned);
             jobs.push(Job {
                 category: Category::Model,
                 label,
@@ -5182,7 +5257,7 @@ impl ModelPlan {
                     };
                     publish_native_impl(
                         Path::new("published"),
-                        &job.resources,
+                        &job.resources.load()?,
                         &job.artifacts,
                         &documents,
                         &mut local,
@@ -5287,6 +5362,7 @@ fn collect_character_gameplay(
         };
         if !job
             .resources
+            .load()?
             .iter()
             .any(|resource| is_character(&resource.alias))
         {
@@ -5302,7 +5378,7 @@ fn collect_character_gameplay(
         };
         publish_native_impl(
             Path::new("published"),
-            &job.resources,
+            &job.resources.load()?,
             &job.artifacts,
             &documents,
             &mut local,
