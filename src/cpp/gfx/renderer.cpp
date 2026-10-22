@@ -103,6 +103,13 @@ struct FrameStats {
     double   acquire_ms = 0;
     double   present_ms = 0;
     double   longest_frame_ms = 0;
+    // What the frames drew, summed for the averages: a count that keeps rising while the scene does not change
+    // points at work that piles up.
+    uint64_t mesh_draws = 0;
+    uint64_t draws_2d = 0;
+    uint64_t grab_copies = 0;
+    uint64_t transient_bytes = 0;
+    uint64_t counted_frames = 0;
     std::chrono::steady_clock::time_point last_open{};
     std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
 };
@@ -134,6 +141,22 @@ void ReportFrameStats() {
              "longest {:.1f} ms",
              s.opened / seconds, seconds * 1000.0 / frames, s.fence_ms / frames, s.acquire_ms / frames,
              s.present_ms / frames, s.longest_frame_ms);
+    uint32_t live_textures = 0;
+    uint32_t live_targets = 0;
+    uint32_t live_meshes = 0;
+    for (const Texture &texture : g.textures) {
+        live_textures += texture.live ? 1 : 0;
+        live_targets += texture.live && texture.render_target ? 1 : 0;
+    }
+    for (const Mesh &mesh : g.meshes) {
+        live_meshes += mesh.live ? 1 : 0;
+    }
+    const double counted = s.counted_frames > 0 ? static_cast<double>(s.counted_frames) : 1.0;
+    kz::Logf(kz::LogLevel::Info, "gfx",
+             "frame work: {:.0f} mesh draws, {:.0f} 2D draws, {:.1f} grab copies, {:.2f} MB transient a frame; "
+             "{} textures ({} render targets), {} meshes live",
+             s.mesh_draws / counted, s.draws_2d / counted, s.grab_copies / counted,
+             s.transient_bytes / counted / (1024.0 * 1024.0), live_textures, live_targets, live_meshes);
     // Each zone's time since the last report, in milliseconds a second: how much of its thread the zone takes.
     for (profile::ZoneTotals *zone = profile::zone_totals.load(std::memory_order_acquire); zone != nullptr;
          zone = zone->next) {
@@ -1367,6 +1390,13 @@ void PresentImage(Frame &frame, VkCommandBuffer cmd, Image &source) {
 }
 
 void PlotFrameCounters() {
+    if (FrameStatsOn()) {
+        g_frame_stats.mesh_draws += g.counters.mesh_draws;
+        g_frame_stats.draws_2d += g.counters.draws_2d;
+        g_frame_stats.grab_copies += g.counters.grab_copies;
+        g_frame_stats.transient_bytes += g.counters.transient_bytes;
+        ++g_frame_stats.counted_frames;
+    }
     KZ_PROFILE_PLOT("Kazarov mesh draws", g.counters.mesh_draws);
     KZ_PROFILE_PLOT("Kazarov 2D draws", g.counters.draws_2d);
     KZ_PROFILE_PLOT("Kazarov grab copies", g.counters.grab_copies);
