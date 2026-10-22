@@ -100,7 +100,15 @@ fn setup_data_with_script_policy(
     policy: ffi::ScriptPublicationPolicy,
 ) -> Result<bool, core::CoreError> {
     let policy = core_script_publication_policy(policy)?;
-    setup::run_with_policy(title, data_root.as_ref(), policy)
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        let _ = (title, data_root, policy);
+        return Ok(false);
+    }
+    #[cfg(feature = "desktop-ui")]
+    {
+        setup::run_with_policy(title, data_root.as_ref(), policy)
+    }
 }
 
 fn bridge_smoke(value: &str) -> Result<String, core::CoreError> {
