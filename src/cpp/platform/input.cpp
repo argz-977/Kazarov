@@ -7,23 +7,24 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
-#include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <numbers>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "kazarov/log.hpp"
 #include "platform/clock.hpp"
-#include "platform/settings.hpp"
 #include "platform/gamepad_map.hpp"
 #include "platform/mouse.hpp"
+#include "platform/settings.hpp"
 #include "platform/touchpad.hpp"
 #include "platform/window.hpp"
 
 namespace {
-
-void ApplyTouch(InputPadState &state);
 
 enum class ActionKind {
     Button,
@@ -160,8 +161,8 @@ struct PadSlot {
     bool         rumble_sent = false;
     Uint64       rumble_time = 0;
     // The lightbar colour the game asked for, kept to restore when the pad reconnects.
-    bool         led_wanted = false;
-    Uint8        led[3] = {};
+    bool  led_wanted = false;
+    Uint8 led[3] = {};
 };
 
 // Which device the player touched last (InputActiveGlyphFamily): false until a key or the mouse is
@@ -190,6 +191,11 @@ std::int64_t                                             g_stick_read_serial = -
 bool                                                     g_stick_live = false;
 bool                                                     g_gamepad_subsystem = false;
 InputKeyboardMouse                                       g_scripted;
+#ifdef __ANDROID__
+// The on-screen gamepad (InputSetTouchOverlay) and whether it is shown.
+InputTouchOverlayState g_touch_overlay;
+bool                   g_touch_overlay_visible = true;
+#endif
 // The mouse is a menu's pointer (InputSetMenuMouse); the motion it has gathered for it.
 bool  g_menu_mouse = false;
 bool  g_menu_navigation = false;
@@ -209,18 +215,6 @@ float            g_touch_wheel = 0.0f;
 std::uint32_t    g_touch_held = 0;
 std::uint32_t    g_touch_tap = 0;
 bool             g_touch_tap_shown = false;
-
-// Screen touch state: active touches from SDL_FINGERDOWN/UP/MOTION events, used on iOS
-// and other touchscreen platforms to map touch to game actions.
-struct TouchPoint {
-    SDL_FingerID finger_id = 0;
-    float        x = 0.0f;   // normalized 0-1 across the screen
-    float        y = 0.0f;   // normalized 0-1 down the screen
-    bool         down = false;
-};
-constexpr int kMaxTouches = 10;
-std::array<TouchPoint, kMaxTouches> g_touch_points{};
-
 // Per host action: presses not yet consumed, and whether its non-key sources (mouse and gamepad
 // buttons, the script's keys) were held at the last poll, for their press edges.
 std::array<int, kHostActionCount>  g_host_presses{};
@@ -256,8 +250,17 @@ bool ParseSource(std::string_view name, ActionKind kind, Source &source) {
         std::size_t star = text.find('*');
         if (star != std::string_view::npos) {
             std::string_view factor = Trim(text.substr(star + 1));
+#ifdef __ANDROID__
+            // Android's libc++ has no floating-point from_chars.
+            std::string factor_text(factor);
+            char       *end = nullptr;
+            scale = std::strtof(factor_text.c_str(), &end);
+            bool parsed = !factor_text.empty() && end == factor_text.c_str() + factor_text.size();
+#else
             auto [end, error] = std::from_chars(factor.data(), factor.data() + factor.size(), scale);
-            if (error != std::errc{} || end != factor.data() + factor.size() || !std::isfinite(scale)) {
+            bool parsed = error == std::errc{} && end == factor.data() + factor.size();
+#endif
+            if (!parsed || !std::isfinite(scale)) {
                 return false;
             }
             text = Trim(text.substr(0, star));
@@ -414,17 +417,11 @@ void ReadGamepad(SDL_Gamepad *gamepad, InputPadState &state) {
                       SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY),
                       SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHTX),
                       SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHTY)};
-    auto   invert = [&](int x) {
-        if (g_stick_invert_x) {
-            axes[x] = Flip(axes[x]);
-        }
-        if (g_stick_invert_y) {
-            axes[x + 1] = Flip(axes[x + 1]);
-        }
-    };
-    invert(2);
-    if (g_look_left) {
-        invert(0);
+    if (g_stick_invert_x) {
+        axes[2] = Flip(axes[2]);
+    }
+    if (g_stick_invert_y) {
+        axes[3] = Flip(axes[3]);
     }
     StickPairToBytes(axes[0], axes[1], state.left_x, state.left_y);
     StickPairToBytes(axes[2], axes[3], state.right_x, state.right_y);
@@ -508,9 +505,6 @@ InputKeyboardMouse LiveKeyboardMouse() {
 void Compose(int pad) {
     g_state[pad] = pad == 0 ? InputApplyKeyboardMouse(g_device[pad], LiveKeyboardMouse()) : g_device[pad];
     InputPadState &state = g_state[pad];
-    if (pad == 0) {
-        ApplyTouch(state);
-    }
     if (pad == 0 && g_look_left && !Deflected(state.left_x) && !Deflected(state.left_y)) {
         state.left_x = state.right_x;
         state.left_y = state.right_y;
@@ -542,7 +536,7 @@ void SyncGamepads() {
             if (slot.gamepad == nullptr) {
                 slot.gamepad = SDL_OpenGamepad(ids[i]);
                 if (slot.gamepad == nullptr) {
-                    std::fprintf(stderr, "input: SDL_OpenGamepad: %s\n", SDL_GetError());
+                    kz::Logf(kz::LogLevel::Warning, "input", "SDL_OpenGamepad: {}", SDL_GetError());
                 } else {
                     EnableGyro(slot.gamepad);
                     SDL_SetGamepadPlayerIndex(slot.gamepad, static_cast<int>(&slot - g_slots.data()));
@@ -682,43 +676,6 @@ void SnapshotBind() {
     g_bind_pad = BindGamepadHeld();
 }
 
-// Touches on the left half of the screen act as a D-pad, touches on the right half as face
-// buttons: a quadrant split of each half maps to a direction or button.
-void ApplyTouch(InputPadState &state) {
-    for (const auto &tp : g_touch_points) {
-        if (!tp.down) {
-            continue;
-        }
-        if (tp.x < 0.5f) {
-            // Left side: D-pad. Split the left half into four quadrants.
-            const float dx = tp.x * 2.0f;   // 0..1 across the left half
-            const float dy = tp.y;          // 0..1 top to bottom
-            if (dx < 0.5f && dy < 0.5f) {
-                state.buttons |= kInputUp;
-            } else if (dx >= 0.5f && dy < 0.5f) {
-                state.buttons |= kInputRight;
-            } else if (dx < 0.5f && dy >= 0.5f) {
-                state.buttons |= kInputDown;
-            } else {
-                state.buttons |= kInputLeft;
-            }
-        } else {
-            // Right side: face buttons. Split into four quadrants.
-            const float dx = (tp.x - 0.5f) * 2.0f; // 0..1 across the right half
-            const float dy = tp.y;                 // 0..1 top to bottom
-            if (dx < 0.5f && dy < 0.5f) {
-                state.buttons |= kInputTriangle;
-            } else if (dx >= 0.5f && dy < 0.5f) {
-                state.buttons |= kInputCircle;
-            } else if (dx < 0.5f && dy >= 0.5f) {
-                state.buttons |= kInputCross;
-            } else {
-                state.buttons |= kInputSquare;
-            }
-        }
-    }
-}
-
 } // namespace
 
 void InputInit() {
@@ -726,7 +683,7 @@ void InputInit() {
     if (SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         g_gamepad_subsystem = true;
     } else {
-        std::fprintf(stderr, "input: no gamepads: %s\n", SDL_GetError());
+        kz::Logf(kz::LogLevel::Warning, "input", "no gamepads: {}", SDL_GetError());
     }
     InputApplyConfig(SettingsGet());
     WindowAddEventHook(InputHandleEvent);
@@ -738,7 +695,7 @@ void InputApplyConfig(const HostSettings &config) {
     for (const ConfigKeyBinding &binding : config.key_bindings) {
         std::vector<std::string_view> names(binding.keys.begin(), binding.keys.end());
         if (!InputBindKeys(binding.action, names)) {
-            std::fprintf(stderr, "input: cannot bind %s\n", binding.action.c_str());
+            kz::Logf(kz::LogLevel::Warning, "input", "cannot bind {}", binding.action);
         }
     }
     g_stick_sensitivity = config.stick_sensitivity;
@@ -769,7 +726,7 @@ void InputApplyConfig(const HostSettings &config) {
     for (const std::string &name : config.mouse_release_keys) {
         int scancode = InputScancodeFromName(name);
         if (scancode < 0) {
-            std::fprintf(stderr, "input: unknown mouse_release key %s\n", name.c_str());
+            kz::Logf(kz::LogLevel::Warning, "input", "unknown mouse_release key {}", name);
             continue;
         }
         mouse.release_scancodes.push_back(scancode);
@@ -800,7 +757,6 @@ void InputShutdown() {
     g_touch_held = g_touch_tap = 0;
     g_mouse_look = {0.0f, 0.0f, g_mouse_look.read};
     g_keys.fill(false);
-    g_touch_points.fill(TouchPoint{});
     g_scripted = {};
     g_scripted_wheel = 0.0f;
     g_host_presses.fill(0);
@@ -850,6 +806,24 @@ static InputGlyphFamily GamepadFamily(SDL_Gamepad *gamepad) {
                                       SDL_GetGamepadProduct(gamepad));
 }
 
+#ifdef __ANDROID__
+// The on-screen gamepad stands in for physical devices, so it hides while one is connected or held.
+bool TouchOverlayWanted() {
+    if (std::ranges::any_of(g_slots, [](const PadSlot &slot) { return slot.gamepad != nullptr; }) ||
+        SDL_HasKeyboard() || MouseButtons() != 0 || std::ranges::find(g_keys, true) != g_keys.end()) {
+        return false;
+    }
+    int                                                 count = 0;
+    std::unique_ptr<SDL_MouseID[], decltype(&SDL_free)> mice(SDL_GetMice(&count), SDL_free);
+    if (mice == nullptr) {
+        return true;
+    }
+    // Touches and pens move the pointer under ids of their own; they are not a mouse.
+    return std::ranges::all_of(std::span(mice.get(), static_cast<std::size_t>(count)),
+                               [](SDL_MouseID id) { return id == SDL_TOUCH_MOUSEID || id == SDL_PEN_MOUSEID; });
+}
+#endif
+
 void InputPoll() {
     EnsureBindings();
     if (g_gamepad_subsystem) {
@@ -858,6 +832,9 @@ void InputPoll() {
     if (g_slots[0].gamepad != nullptr) {
         g_pad_family = GamepadFamily(g_slots[0].gamepad);
     }
+#ifdef __ANDROID__
+    g_touch_overlay_visible = TouchOverlayWanted();
+#endif
     for (int pad = 0; pad < kInputPadCount; ++pad) {
         InputPadState state;
         state.connected = pad == 0 || g_slots[pad].gamepad != nullptr;
@@ -865,8 +842,7 @@ void InputPoll() {
             ReadGamepad(g_slots[pad].gamepad, state);
         }
         g_device[pad] = state;
-        if (pad == 0 && g_slots[0].gamepad != nullptr && (state.buttons != 0 || Deflected(state.left_x) || Deflected(state.left_y) ||
-                                                           Deflected(state.right_x) || Deflected(state.right_y))) {
+        if (pad == 0 && g_slots[0].gamepad != nullptr && (state.buttons != 0 || Deflected(state.left_x) || Deflected(state.left_y) || Deflected(state.right_x) || Deflected(state.right_y))) {
             g_last_keyboard = false;
         }
         Compose(pad);
@@ -934,37 +910,6 @@ void InputHandleEvent(const SDL_Event &event) {
             g_menu_dx = 0.0f;
             g_menu_dy = 0.0f;
             break;
-        case SDL_EVENT_FINGER_DOWN: {
-            for (auto &tp : g_touch_points) {
-                if (!tp.down) {
-                    tp.finger_id = event.tfinger.fingerID;
-                    tp.x = event.tfinger.x;
-                    tp.y = event.tfinger.y;
-                    tp.down = true;
-                    break;
-                }
-            }
-            break;
-        }
-        case SDL_EVENT_FINGER_UP: {
-            for (auto &tp : g_touch_points) {
-                if (tp.down && tp.finger_id == event.tfinger.fingerID) {
-                    tp.down = false;
-                    break;
-                }
-            }
-            break;
-        }
-        case SDL_EVENT_FINGER_MOTION: {
-            for (auto &tp : g_touch_points) {
-                if (tp.down && tp.finger_id == event.tfinger.fingerID) {
-                    tp.x = event.tfinger.x;
-                    tp.y = event.tfinger.y;
-                    break;
-                }
-            }
-            break;
-        }
         default:
             break;
     }
@@ -1115,12 +1060,33 @@ void InputNoteLeftStickRead() { g_stick_read_serial = g_latch_serial; }
 
 bool InputLeftStickLive() { return g_stick_live; }
 
+#ifdef __ANDROID__
+void InputSetTouchOverlay(const InputTouchOverlayState &state) {
+    g_touch_overlay = state;
+    if (state.buttons != 0 || state.left_x != 0.0f || state.left_y != 0.0f || state.right_x != 0.0f ||
+        state.right_y != 0.0f) {
+        g_last_keyboard = false;
+    }
+}
+
+bool InputTouchOverlayVisible() { return g_touch_overlay_visible; }
+#endif
+
 const InputPadState &InputGetPad(int pad) {
     static const InputPadState kAbsent;
     if (pad < 0 || pad >= kInputPadCount) {
         return kAbsent;
     }
     g_view[pad] = g_override[pad] ? *g_override[pad] : g_state[pad];
+#ifdef __ANDROID__
+    if (pad == 0 && g_touch_overlay_visible && !g_override[pad]) {
+        g_view[pad].buttons |= g_touch_overlay.buttons;
+        g_view[pad].left_x = InputStickByte(g_touch_overlay.left_x);
+        g_view[pad].left_y = InputStickByte(g_touch_overlay.left_y);
+        g_view[pad].right_x = InputStickByte(g_touch_overlay.right_x);
+        g_view[pad].right_y = InputStickByte(g_touch_overlay.right_y);
+    }
+#endif
     if (g_keyboard_stick_navigation && !g_stick_live) {
         g_view[pad].buttons |= g_view[pad].stick_dpad;
     }

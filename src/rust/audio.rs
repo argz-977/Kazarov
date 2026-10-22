@@ -1,9 +1,15 @@
 //! Converts retail sound resources to PCM WAV and semantic JSON before publication.
+use super::archive::ResourceRef;
+use super::artifacts::{ArtifactBytes, AssetSink, Category, Job};
+use super::inventory::Inventory;
+use super::progress::Phase;
 use super::{CoreError, CoreResult};
+use rayon::prelude::*;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, PoisonError};
 
 fn fail(message: impl Into<String>) -> CoreError {
     CoreError(message.into())
@@ -69,7 +75,7 @@ fn adpcm(b: &[u8]) -> CoreResult<(Vec<i16>, usize, bool)> {
     const FILTER: [[i32; 2]; 5] = [[0, 0], [60, 0], [115, -52], [98, -55], [122, -60]];
     let mut out = Vec::new();
     let (mut h0, mut h1, mut loop_start, mut loops) = (0, 0, 0, false);
-    for block in b.chunks_exact(16) {
+    for block in b.as_chunks::<16>().0 {
         let shift = if block[0] & 15 > 12 { 9 } else { block[0] & 15 };
         let filter = FILTER[usize::from(block[0] >> 4).min(4)];
         if block[1] & 4 != 0 {
@@ -94,7 +100,7 @@ fn adpcm(b: &[u8]) -> CoreResult<(Vec<i16>, usize, bool)> {
     Ok((out, loop_start, loops))
 }
 fn wav(pcm: &[i16], rate: u32, channels: u16) -> CoreResult<Vec<u8>> {
-    if rate == 0 || !(1..=2).contains(&channels) || pcm.len() % channels as usize != 0 {
+    if rate == 0 || !(1..=2).contains(&channels) || !pcm.len().is_multiple_of(channels as usize) {
         return Err(fail("invalid PCM layout"));
     }
     let bytes = u32::try_from(pcm.len() * 2).map_err(|_| fail("PCM WAV exceeds RIFF size"))?;
@@ -174,7 +180,12 @@ fn write_json(root: &Path, relative: &str, value: &Value) -> CoreResult<()> {
     write(root, relative, &b)
 }
 
-fn bank(root: &Path, key: &str, hd: &[u8], bd: &[u8]) -> CoreResult<String> {
+fn bank_with(
+    key: &str,
+    hd: &[u8],
+    bd: &[u8],
+    emit: &mut impl FnMut(&str, Vec<u8>) -> CoreResult<()>,
+) -> CoreResult<String> {
     let programs=entries(chunk(hd,b"Prog")?)?.into_iter().map(|p| {
         if p.is_empty() { return Ok(json!({"present":false})); }
         if p.len()<36 {return Err(fail("truncated bank program"));}
@@ -219,16 +230,21 @@ fn bank(root: &Path, key: &str, hd: &[u8], bd: &[u8]) -> CoreResult<String> {
         let (pcm, loop_start, loops) =
             adpcm(bd.get(offset..).ok_or_else(|| fail("sample outside BD"))?)?;
         let sample_path = path(key, &format!("sample-{index}.wav"));
-        write(root, &sample_path, &wav(&pcm, rate as u32, 1)?)?;
+        emit(&sample_path, wav(&pcm, rate as u32, 1)?)?;
         vags.push(json!({"wav":sample_path,"attr":p[6],"loop_start":loop_start,"loop_end":pcm.len(),"loops":loops}));
     }
     let document = path(key, "bank.json");
-    write_json(
-        root,
+    emit(
         &document,
-        &json!({"schema_version":1,"kind":"bank","programs":programs,"sample_sets":sets,"samples":samples,"vags":vags}),
+        serde_json::to_vec(
+            &json!({"schema_version":1,"kind":"bank","programs":programs,"sample_sets":sets,"samples":samples,"vags":vags}),
+        )?,
     )?;
     Ok(document)
+}
+
+fn bank(root: &Path, key: &str, hd: &[u8], bd: &[u8]) -> CoreResult<String> {
+    bank_with(key, hd, bd, &mut |name, bytes| write(root, name, &bytes))
 }
 
 fn varlen(b: &[u8], at: &mut usize) -> CoreResult<u32> {
@@ -320,7 +336,11 @@ fn events(b: &[u8]) -> CoreResult<Vec<Value>> {
     }
     Ok(out)
 }
-fn sequence(root: &Path, key: &str, sq: &[u8]) -> CoreResult<String> {
+fn sequence_with(
+    key: &str,
+    sq: &[u8],
+    emit: &mut impl FnMut(&str, Vec<u8>) -> CoreResult<()>,
+) -> CoreResult<String> {
     let midi = chunk(sq, b"Midi")?;
     let blocks = entries(midi)?;
     let mut songs = Vec::new();
@@ -348,15 +368,22 @@ fn sequence(root: &Path, key: &str, sq: &[u8]) -> CoreResult<String> {
         songs.push(json!({"division":division,"events":events(p.get(offset..).ok_or_else(||fail("SQ data offset outside song"))?)?}));
     }
     let document = path(key, "sequence.json");
-    write_json(
-        root,
+    emit(
         &document,
-        &json!({"schema_version":1,"kind":"sequence","songs":songs}),
+        serde_json::to_vec(&json!({"schema_version":1,"kind":"sequence","songs":songs}))?,
     )?;
     Ok(document)
 }
 
-fn smf(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
+fn sequence(root: &Path, key: &str, sq: &[u8]) -> CoreResult<String> {
+    sequence_with(key, sq, &mut |name, bytes| write(root, name, &bytes))
+}
+
+fn smf_with(
+    key: &str,
+    b: &[u8],
+    emit: &mut impl FnMut(&str, Vec<u8>) -> CoreResult<()>,
+) -> CoreResult<String> {
     fn be16(b: &[u8], at: usize) -> CoreResult<u16> {
         Ok(u16::from_be_bytes(
             b.get(at..at + 2)
@@ -433,12 +460,17 @@ fn smf(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
         );
     }
     let document = path(key, "sequence.json");
-    write_json(
-        root,
+    emit(
         &document,
-        &json!({"schema_version":1,"kind":"effect_sequence","tick_rate":division as u32*225/60,"events":out}),
+        serde_json::to_vec(
+            &json!({"schema_version":1,"kind":"effect_sequence","tick_rate":division as u32*225/60,"events":out}),
+        )?,
     )?;
     Ok(document)
+}
+
+fn smf(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
+    smf_with(key, b, &mut |name, bytes| write(root, name, &bytes))
 }
 
 fn sound_rows(b: &[u8], count: usize) -> Vec<Vec<Vec<u8>>> {
@@ -496,11 +528,11 @@ fn atoi(b: &[u8]) -> i32 {
     }) * sign
 }
 fn scene_reverb(b: &[u8]) -> CoreResult<Value> {
-    if b.len() % 8 != 0 || b.len() / 8 > 256 {
+    if !b.len().is_multiple_of(8) || b.len() / 8 > 256 {
         return Err(fail("invalid scene reverb table size"));
     }
     let mut rows = Vec::new();
-    for record in b.chunks_exact(8) {
+    for record in b.as_chunks::<8>().0 {
         rows.push(json!({"id":u16le(record,0)? as i16,"type":u16le(record,2)? as i16,"depth":u16le(record,4)? as i16}));
     }
     Ok(json!({"schema_version":1,"kind":"scene_reverb","rows":rows}))
@@ -616,7 +648,7 @@ fn verify_scene_table(document: &Value, kind: &str) -> CoreResult<()> {
     }
     Ok(())
 }
-fn sound_metadata(root: &Path, key: &str, b: &[u8], volume: bool) -> CoreResult<String> {
+fn sound_metadata_document(b: &[u8], volume: bool) -> CoreResult<Value> {
     let rows = sound_rows(b, if volume { 3 } else { 8 });
     let mut entries = Vec::new();
     let mut reverb = Vec::new();
@@ -643,7 +675,6 @@ fn sound_metadata(root: &Path, key: &str, b: &[u8], volume: bool) -> CoreResult<
             entries.push(json!({"filename":file,"program":atoi(&row[5]) as i8,"key":atoi(&row[6]) as i8,"flag":!row[7].is_empty()}));
         }
     }
-    let document = path(key, if volume { "volume.json" } else { "config.json" });
     let kind = if volume {
         "sound_volume"
     } else {
@@ -653,8 +684,103 @@ fn sound_metadata(root: &Path, key: &str, b: &[u8], volume: bool) -> CoreResult<
     if !volume {
         value["entry_count"] = json!(rows.len());
     }
-    write_json(root, &document, &value)?;
+    Ok(value)
+}
+
+fn sound_metadata(root: &Path, key: &str, b: &[u8], volume: bool) -> CoreResult<String> {
+    let document = path(key, if volume { "volume.json" } else { "config.json" });
+    write_json(root, &document, &sound_metadata_document(b, volume)?)?;
     Ok(document)
+}
+
+/// Reconstructs all loose sound routing and volume settings from indexed retail extents.
+pub fn gameplay_documents(
+    source: &super::archive::SourceTree,
+) -> CoreResult<BTreeMap<String, Value>> {
+    let inventory = super::inventory::Inventory::build(source)?;
+    let mut documents = BTreeMap::new();
+    if let Some(resource) = inventory.get("snd2/rev.bin") {
+        documents.insert("snd2/rev.json".to_owned(), scene_reverb(resource.bytes())?);
+    }
+    if let Some(resource) = inventory.get("snd2/map_index.txt") {
+        documents.insert(
+            "snd2/map_index.json".to_owned(),
+            scene_sound_routes(resource.bytes())?,
+        );
+    }
+    let mut sequence_names = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for resource in inventory.leaves() {
+        let key = resource.alias.to_ascii_lowercase();
+        let Some((group, member)) = key.split_once(".snd/") else {
+            continue;
+        };
+        if member.ends_with(".sq") || member.ends_with(".mid") {
+            sequence_names
+                .entry(format!("{group}.snd"))
+                .or_default()
+                .entry(member.rsplit('/').next().unwrap_or(member).to_owned())
+                .or_insert_with(|| path(&key, "sequence.json"));
+        }
+    }
+    for resource in inventory.leaves() {
+        let key = resource.alias.to_ascii_lowercase();
+        if !owns_config(&key) {
+            continue;
+        }
+        let volume = key.ends_with(".vol");
+        let mut document = sound_metadata_document(resource.bytes(), volume)?;
+        if !volume {
+            let (group, _) = key
+                .split_once(".snd/")
+                .ok_or_else(|| fail(format!("sound config outside bundle: {key}")))?;
+            let names = sequence_names.get(&format!("{group}.snd"));
+            for entry in document["entries"].as_array_mut().unwrap() {
+                let original = entry["filename"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if let Some(uri) = names.and_then(|names| names.get(&original)) {
+                    entry["filename"] = json!(uri);
+                } else if original.contains('.') {
+                    entry["filename"] = json!("");
+                }
+            }
+        }
+        let output = path(&key, if volume { "volume.json" } else { "config.json" });
+        if documents.insert(output.clone(), document).is_some() {
+            return Err(fail(format!("duplicate sound gameplay document: {output}")));
+        }
+    }
+    Ok(documents)
+}
+
+/// Updates only generated sound gameplay documents in explicit refresh mode.
+pub fn export_gameplay(
+    source: &super::archive::SourceTree,
+    destination: &Path,
+) -> CoreResult<usize> {
+    let documents = gameplay_documents(source)?;
+    for (name, document) in &documents {
+        write_json(destination, name, document)?;
+    }
+    Ok(documents.len())
+}
+
+/// Compares loose sound gameplay documents with every retail source field.
+pub fn audit_gameplay(
+    source: &super::archive::SourceTree,
+    destination: &Path,
+) -> CoreResult<usize> {
+    let documents = gameplay_documents(source)?;
+    for (name, expected) in &documents {
+        let actual: Value = serde_json::from_slice(&fs::read(destination.join(name))?)?;
+        if &actual != expected {
+            return Err(fail(format!(
+                "sound gameplay differs from PAL source: {name}"
+            )));
+        }
+    }
+    Ok(documents.len())
 }
 
 /// Reads the PS2 SShd planar/interleaved PCM wrapper used by streams and movie private PES packets.
@@ -669,7 +795,7 @@ fn sshd(b: &[u8]) -> CoreResult<(Vec<i16>, u32, u16)> {
     let rate = u32le(b, 12)?;
     let channels = u32le(b, 16)? as usize;
     let interleave = u32le(b, 20)? as usize;
-    if !(1..=2).contains(&channels) || interleave == 0 || interleave % 2 != 0 {
+    if !(1..=2).contains(&channels) || interleave == 0 || !interleave.is_multiple_of(2) {
         return Err(fail("invalid SShd layout"));
     }
     let bytes = u32le(b, body + 4)? as usize;
@@ -679,7 +805,7 @@ fn sshd(b: &[u8]) -> CoreResult<(Vec<i16>, u32, u16)> {
     let mut pcm = Vec::with_capacity(bytes / 2);
     for group in data.chunks(interleave * channels) {
         let stride = group.len() / channels;
-        if stride % 2 != 0 {
+        if !stride.is_multiple_of(2) {
             return Err(fail("unaligned SShd group"));
         }
         for frame in 0..stride / 2 {
@@ -720,8 +846,10 @@ fn stream(b: &[u8]) -> CoreResult<Vec<u8>> {
     let rate = u32le(f, 4)?;
     if codec == 1 && u16le(f, 14)? == 16 {
         return wav(
-            &d.chunks_exact(2)
-                .map(|s| i16::from_le_bytes([s[0], s[1]]))
+            &d.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| i16::from_le_bytes(*s))
                 .collect::<Vec<_>>(),
             rate,
             channels,
@@ -731,7 +859,7 @@ fn stream(b: &[u8]) -> CoreResult<Vec<u8>> {
         return Err(fail(format!("unsupported WAV codec {codec:#x}")));
     }
     let block_align = u16le(f, 12)? as usize;
-    if block_align < 16 * channels as usize || block_align % (16 * channels as usize) != 0 {
+    if block_align < 16 * channels as usize || !block_align.is_multiple_of(16 * channels as usize) {
         return Err(fail("invalid SPU WAV block alignment"));
     }
     // Each block contains one planar run per channel; predictor history continues between blocks.
@@ -831,161 +959,366 @@ fn movie(b: &[u8]) -> CoreResult<Option<(Vec<u8>, Value)>> {
     )))
 }
 
-fn movie_mp4(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SERIAL: AtomicU64 = AtomicU64::new(0);
-    struct Temporary(std::path::PathBuf);
-    impl Drop for Temporary {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let temporary = Temporary(root.parent().unwrap_or(root).join(format!(
-        ".movie-work-{}-{}",
-        std::process::id(),
-        SERIAL.fetch_add(1, Ordering::Relaxed)
-    )));
-    fs::create_dir_all(&temporary.0)?;
-    let video = temporary.0.join("video.mpeg");
-    fs::write(&video, strip_movie_audio(b)?)?;
-    let audio = movie(b)?;
-    let audio_path = temporary.0.join("audio.wav");
-    if let Some((wav, _)) = &audio {
-        fs::write(&audio_path, wav)?;
-    }
+fn movie_target(key: &str) -> String {
     let name = key
         .strip_prefix("movie/")
         .unwrap_or(key)
         .trim_end_matches(".pss");
-    let target = format!("movie/{name}.mp4");
-    fs::create_dir_all(root.join(&target).parent().unwrap())?;
-    convert_movie(
-        &video,
-        audio.is_some().then_some(audio_path.as_path()),
-        &root.join(&target),
-    )?;
-    Ok(target)
+    format!("movie/{name}.mp4")
 }
 
-/// Copies the MPEG-2 video and encodes the PCM audio as ALAC into an MP4, with the FFmpeg command.
-#[cfg(not(target_os = "ios"))]
-fn convert_movie(video: &Path, audio: Option<&Path>, output: &Path) -> CoreResult<()> {
-    use std::process::Command;
-    let sibling = std::env::current_exe().ok().and_then(|p| {
-        p.parent().map(|p| {
-            p.join(if cfg!(windows) {
-                "ffmpeg.exe"
-            } else {
-                "ffmpeg"
-            })
-        })
-    });
-    let executable = std::env::var_os("KAZAROV_FFMPEG")
-        .map(std::path::PathBuf::from)
-        .or_else(|| sibling.filter(|p| p.is_file()))
-        .or_else(|| {
-            option_env!("KAZAROV_FFMPEG")
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_file())
-        })
-        .unwrap_or_else(|| "ffmpeg".into());
-    let mut command = Command::new(&executable);
-    #[cfg(windows)]
+/// Exports representative retail and converted movies for explicit, post-extraction parity checks.
+pub fn export_movie_parity_fixture(
+    source: &super::archive::SourceTree,
+    archive_path: &Path,
+    destination: &Path,
+) -> CoreResult<usize> {
+    let archive = super::zip_archive::Archive::open(archive_path)?;
+    let directory = destination.join("movies");
+    fs::create_dir_all(&directory)?;
+    let mut selected_audio = false;
+    let mut selected_silent = false;
+    let mut cases = Vec::new();
+    for alias in source
+        .names()
+        .filter(|alias| alias.to_ascii_lowercase().ends_with(".pss"))
     {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
+        let original = source.read(alias)?;
+        let decoded = movie(&original)?;
+        if decoded.is_some() && selected_audio || decoded.is_none() && selected_silent {
+            continue;
+        }
+        let video = strip_movie_audio(&original)?;
+        let target = movie_target(alias);
+        let index = (0..archive.len())
+            .find(|index| archive.name(*index) == target)
+            .ok_or_else(|| fail(format!("converted movie missing from archive: {target}")))?;
+        let converted = archive.read(index)?;
+        let prefix = format!("movie_{}", cases.len());
+        let video_name = format!("{prefix}.video.ps");
+        let output_name = format!("{prefix}.mp4");
+        fs::write(directory.join(&video_name), video)?;
+        fs::write(directory.join(&output_name), converted)?;
+        let (wav_name, alignment) = if let Some((wav, alignment)) = decoded {
+            let name = format!("{prefix}.wav");
+            fs::write(directory.join(&name), wav)?;
+            selected_audio = true;
+            (Some(name), alignment)
+        } else {
+            selected_silent = true;
+            (None, Value::Null)
+        };
+        cases.push(
+            json!({"source_alias":alias,"archive_alias":target,"video":video_name,
+            "mp4":output_name,"wav":wav_name,"alignment":alignment}),
+        );
+        if selected_audio && selected_silent {
+            break;
+        }
     }
-    command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-copyts",
-            "-start_at_zero",
-            "-i",
-        ])
-        .arg(video);
-    if let Some(audio) = audio {
-        command.arg("-i").arg(audio);
+    if !selected_audio {
+        return Err(fail("no PAL movie with native audio for parity"));
     }
-    command.args(["-map", "0:v:0"]);
-    if audio.is_some() {
-        command.args(["-map", "1:a:0", "-c:a", "alac"]);
-    }
-    command
-        .args([
-            "-c:v",
-            "copy",
-            "-map_metadata",
-            "-1",
-            "-fflags",
-            "+bitexact",
-            "-flags:a",
-            "+bitexact",
-            "-threads",
-            "1",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-        ])
-        .arg(output);
-    let result = command.output().map_err(|e| {
-        fail(format!(
-            "{}: movie MP4 conversion requires FFmpeg: {e}",
-            executable.display()
-        ))
-    })?;
-    if !result.status.success() {
-        return Err(fail(format!(
-            "FFmpeg MP4 conversion failed: {}",
-            String::from_utf8_lossy(&result.stderr)
-        )));
-    }
-    Ok(())
+    let count = cases.len();
+    let mut manifest = serde_json::to_vec_pretty(
+        &json!({"schema_version":1,"kind":"movie_parity","cases":cases}),
+    )?;
+    manifest.push(b'\n');
+    fs::write(directory.join("manifest.json"), manifest)?;
+    Ok(count)
 }
 
-/// An iOS app cannot start the FFmpeg command, so the game converts with FFmpeg's libraries in process: the
-/// executable that links kazarov_core on iOS defines kz_movie_mp4, with the command's output.
-#[cfg(target_os = "ios")]
-fn convert_movie(video: &Path, audio: Option<&Path>, output: &Path) -> CoreResult<()> {
-    use std::ffi::{CStr, CString, c_char, c_int};
-    use std::os::unix::ffi::OsStrExt;
-    unsafe extern "C" {
-        fn kz_movie_mp4(
-            video: *const c_char,
-            audio: *const c_char,
-            output: *const c_char,
-            error: *mut c_char,
-            error_size: usize,
-        ) -> c_int;
-    }
-    let c_path = |path: &Path| {
-        CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| fail(format!("{}: path holds a NUL byte", path.display())))
-    };
-    let video = c_path(video)?;
-    let audio = audio.map(c_path).transpose()?;
-    let output = c_path(output)?;
-    let mut error = [0 as c_char; 512];
-    // SAFETY: every path is a NUL-terminated string that outlives the call, and error is writable for its length.
+#[cfg(kazarov_ffmpeg)]
+unsafe extern "C" {
+    fn kazarov_mux_movie(
+        video: *const u8,
+        video_size: usize,
+        wav: *const u8,
+        wav_size: usize,
+        result_bytes: *mut *mut u8,
+        result_size: *mut usize,
+        error: *mut std::ffi::c_char,
+        error_size: usize,
+    ) -> i32;
+    fn kazarov_free_movie(buffer: *mut u8);
+}
+
+/// Muxes the original MPEG-2 video and lossless ALAC audio through seekable memory AVIO.
+#[cfg(kazarov_ffmpeg)]
+fn movie_mp4_memory(source: &[u8]) -> CoreResult<Vec<u8>> {
+    let video = strip_movie_audio(source)?;
+    let audio = movie(source)?.map(|(wav, _)| wav);
+    let mut bytes = std::ptr::null_mut();
+    let mut length = 0usize;
+    let mut error = [0 as std::ffi::c_char; 256];
+    let (wav, wav_size) = audio
+        .as_ref()
+        .map_or((std::ptr::null(), 0), |wav| (wav.as_ptr(), wav.len()));
     let status = unsafe {
-        kz_movie_mp4(
+        kazarov_mux_movie(
             video.as_ptr(),
-            audio.as_ref().map_or(std::ptr::null(), |a| a.as_ptr()),
-            output.as_ptr(),
+            video.len(),
+            wav,
+            wav_size,
+            &mut bytes,
+            &mut length,
             error.as_mut_ptr(),
             error.len(),
         )
     };
-    if status != 0 {
-        // SAFETY: kz_movie_mp4 leaves a NUL-terminated message in error on failure.
-        let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
-        return Err(fail(format!("FFmpeg MP4 conversion failed: {message}")));
+    if status < 0 {
+        let message = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+        return Err(fail(format!(
+            "in-memory FFmpeg movie mux failed: {message}"
+        )));
     }
-    Ok(())
+    if bytes.is_null() || length == 0 {
+        return Err(fail("in-memory movie mux returned no MP4 bytes"));
+    }
+    let result = unsafe { std::slice::from_raw_parts(bytes, length).to_vec() };
+    unsafe { kazarov_free_movie(bytes) };
+    Ok(result)
+}
+
+#[cfg(not(kazarov_ffmpeg))]
+fn movie_mp4_memory(_: &[u8]) -> CoreResult<Vec<u8>> {
+    Err(fail(
+        "in-memory movie mux requires FFmpeg development libraries",
+    ))
+}
+
+/// Asset conversion jobs and retail audio resources removed from the retained PACK stream.
+pub struct AudioPlan {
+    pub jobs: Vec<Job>,
+    pub consumed: HashSet<String>,
+}
+
+fn submit_json(sink: &AssetSink, name: &str, document: &Value) -> CoreResult<()> {
+    sink.submit(
+        name.to_owned(),
+        ArtifactBytes::Owned(serde_json::to_vec(document)?),
+        Category::Audio,
+    )
+}
+
+/// Plans sound and movie conversion without copying any retail source bytes.
+pub fn plan_stream(inventory: &Inventory) -> CoreResult<AudioPlan> {
+    let mut jobs = Vec::new();
+    let mut consumed = HashSet::new();
+    let mut leaves = BTreeMap::<String, ResourceRef>::new();
+    let mut groups = BTreeMap::<String, String>::new();
+    for resource in inventory.leaves() {
+        let key = resource.alias.to_ascii_lowercase();
+        if let Some((base, _)) = key.split_once(".snd/") {
+            let lower = format!("{base}.snd");
+            groups
+                .entry(lower)
+                .or_insert_with(|| resource.alias[..base.len() + 4].to_owned());
+        }
+        leaves.insert(key, resource.clone());
+    }
+    for (key, resource) in &leaves {
+        let owned = matches!(
+            key.as_str(),
+            "sound/sound.dat" | "sound/sound.hd3" | "snd2/rev.bin" | "snd2/map_index.txt"
+        ) || key.ends_with(".snd")
+            || key.ends_with(".hd")
+            || key.ends_with(".bd")
+            || key.ends_with(".sq")
+            || key.ends_with(".mid")
+            || key.ends_with(".pss")
+            || owns_config(key)
+            || key.ends_with(".vol")
+            || key.ends_with(".wav")
+            || resource.bytes().starts_with(b"SShd")
+            || (resource.bytes().starts_with(b"RIFF")
+                && resource.bytes().get(8..12) == Some(b"WAVE"));
+        if !owned {
+            continue;
+        }
+        consumed.insert(resource.alias.clone());
+        if matches!(
+            key.as_str(),
+            "sound/sound.dat" | "sound/sound.hd3" | "snd2/rev.bin" | "snd2/map_index.txt"
+        ) || owns_config(key)
+            || key.ends_with(".vol")
+        {
+            continue;
+        }
+        if key.ends_with(".hd") {
+            let bd_key = format!("{}.bd", key.trim_end_matches(".hd"));
+            let bd = leaves
+                .get(&bd_key)
+                .or_else(|| {
+                    leaves
+                        .iter()
+                        .find(|(name, _)| {
+                            Path::new(name).parent() == Path::new(key).parent()
+                                && name.ends_with(".bd")
+                        })
+                        .map(|(_, resource)| resource)
+                })
+                .ok_or_else(|| fail(format!("bank BD companion missing: {key}")))?
+                .clone();
+            let key = key.clone();
+            let hd = resource.clone();
+            jobs.push(Job {
+                category: Category::Audio,
+                label: key.clone(),
+                work: (hd.len() + bd.len()) as u64,
+                estimated_bytes: bd.len().saturating_mul(4).saturating_add(hd.len()),
+                run: Box::new(move |sink| {
+                    bank_with(&key, hd.bytes(), bd.bytes(), &mut |name, bytes| {
+                        sink.submit(
+                            name.to_owned(),
+                            ArtifactBytes::Owned(bytes),
+                            Category::Audio,
+                        )
+                    })?;
+                    Ok(())
+                }),
+            });
+        } else if key.ends_with(".sq") || key.ends_with(".mid") {
+            let key = key.clone();
+            let input = resource.clone();
+            jobs.push(Job {
+                category: Category::Audio,
+                label: key.clone(),
+                work: input.len() as u64,
+                estimated_bytes: input.len().saturating_mul(4),
+                run: Box::new(move |sink| {
+                    let mut emit = |name: &str, bytes| {
+                        sink.submit(
+                            name.to_owned(),
+                            ArtifactBytes::Owned(bytes),
+                            Category::Audio,
+                        )
+                    };
+                    if key.ends_with(".sq") {
+                        sequence_with(&key, input.bytes(), &mut emit)?;
+                    } else {
+                        smf_with(&key, input.bytes(), &mut emit)?;
+                    }
+                    Ok(())
+                }),
+            });
+        } else if key.ends_with(".pss") {
+            let key = key.clone();
+            let input = resource.clone();
+            jobs.push(Job {
+                category: Category::Movie,
+                label: key.clone(),
+                work: input.len() as u64,
+                estimated_bytes: input.len().saturating_mul(3),
+                run: Box::new(move |sink| {
+                    let mp4 = movie_mp4_memory(input.bytes())?;
+                    sink.submit(
+                        movie_target(&key),
+                        ArtifactBytes::Owned(mp4),
+                        Category::Movie,
+                    )
+                }),
+            });
+        } else if key.ends_with(".wav")
+            || resource.bytes().starts_with(b"SShd")
+            || (resource.bytes().starts_with(b"RIFF")
+                && resource.bytes().get(8..12) == Some(b"WAVE"))
+        {
+            let key = key.clone();
+            let input = resource.clone();
+            jobs.push(Job {
+                category: Category::Audio,
+                label: key.clone(),
+                work: input.len() as u64,
+                estimated_bytes: input.len().saturating_mul(3),
+                run: Box::new(move |sink| {
+                    sink.submit(
+                        format!("{}.wav", key.trim_end_matches(".wav")),
+                        ArtifactBytes::Owned(
+                            stream(input.bytes())
+                                .map_err(|error| fail(format!("{key}: {error}")))?,
+                        ),
+                        Category::Audio,
+                    )
+                }),
+            });
+        }
+    }
+    for (group, original_group) in groups {
+        let members = inventory
+            .members(&original_group)
+            .ok_or_else(|| fail(format!("sound bundle is not a PACK: {group}")))?;
+        let mut bank = Value::Null;
+        let mut config = Value::Null;
+        let mut volume = Value::Null;
+        let mut sequences = Vec::new();
+        let mut effects = Vec::new();
+        for member in members {
+            let key = member.alias.to_ascii_lowercase();
+            if key.ends_with(".hd") {
+                bank = json!(path(&key, "bank.json"));
+            }
+            if key.ends_with(".cfg") {
+                config = json!(path(&key, "config.json"));
+            }
+            if key.ends_with(".vol") {
+                volume = json!(path(&key, "volume.json"));
+            }
+            if key.ends_with(".sq") {
+                sequences.push(path(&key, "sequence.json"));
+            }
+            if key.ends_with(".mid") {
+                effects.push(path(&key, "sequence.json"));
+            }
+        }
+        if config.is_null() || volume.is_null() {
+            return Err(fail(format!("{group}: sound controls missing")));
+        }
+        let output = format!("{}.sound.json", group.trim_end_matches(".snd"));
+        let document = json!({"schema_version":1,"kind":"sound_bundle","bank":bank,"sequences":sequences,"effect_sequences":effects,"config":config,"volume":volume});
+        jobs.push(Job {
+            category: Category::Audio,
+            label: group.clone(),
+            work: 4096,
+            estimated_bytes: 4096,
+            run: Box::new(move |sink| submit_json(sink, &output, &document)),
+        });
+        consumed.insert(original_group);
+    }
+    Ok(AudioPlan { jobs, consumed })
+}
+
+static FFMPEG_SLOTS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct FfmpegSlot;
+
+impl FfmpegSlot {
+    fn acquire() -> Self {
+        let (running, released) = &FFMPEG_SLOTS;
+        let limit = rayon::current_num_threads().clamp(1, 4);
+        let mut running = running.lock().unwrap_or_else(PoisonError::into_inner);
+        while *running >= limit {
+            running = released
+                .wait(running)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *running += 1;
+        Self
+    }
+}
+
+impl Drop for FfmpegSlot {
+    fn drop(&mut self) {
+        let (running, released) = &FFMPEG_SLOTS;
+        *running.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        released.notify_one();
+    }
+}
+
+fn movie_mp4(root: &Path, key: &str, b: &[u8]) -> CoreResult<String> {
+    let target = movie_target(key);
+    write(root, &target, &movie_mp4_memory(b)?)?;
+    Ok(target)
 }
 
 fn pack(b: &[u8]) -> Option<Vec<(String, &[u8])>> {
@@ -1019,34 +1352,118 @@ fn pack(b: &[u8]) -> Option<Vec<(String, &[u8])>> {
     }
     None
 }
-fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) -> CoreResult<()> {
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) -> CoreResult<()> {
     for e in fs::read_dir(dir)? {
         let p = e?.path();
         if p.is_dir() {
-            collect(root, &p, files)?;
+            files_under(&p, out)?;
         } else {
-            let key = p
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase();
-            if key == "sound/sound.dat" || key == "sound/sound.hd3" {
-                continue;
-            }
-            if ["cfg", "vol"].contains(&p.extension().and_then(|s| s.to_str()).unwrap_or(""))
-                && ["hd", "sq", "mid"]
-                    .iter()
-                    .any(|ext| p.with_extension(ext).is_file())
-            {
-                files.insert(key, fs::read(&p)?);
-                continue;
-            }
-            let b = fs::read(&p)?;
-            expand(&key, b, files, 0)?;
+            out.push(p);
         }
     }
     Ok(())
+}
+#[cfg(test)]
+fn collect(raw: &Path, phase: &Phase) -> CoreResult<BTreeMap<String, Vec<u8>>> {
+    collect_source(&super::archive::SourceTree::directory(raw)?, phase)
+}
+
+fn source_sidecar(source: &super::archive::SourceTree, key: &str) -> bool {
+    let path = Path::new(key);
+    ["cfg", "vol"].contains(&path.extension().and_then(|s| s.to_str()).unwrap_or(""))
+        && ["hd", "sq", "mid"].iter().any(|ext| {
+            source.contains(
+                &path
+                    .with_extension(ext)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            )
+        })
+}
+
+/// True when conversion replaces a complete retail source file.
+pub fn owns_source(source: &super::archive::SourceTree, key: &str) -> CoreResult<bool> {
+    let lower = key.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "sound/sound.dat" | "sound/sound.hd3" | "snd2/rev.bin" | "snd2/map_index.txt"
+    ) {
+        return Ok(true);
+    }
+    if ["snd", "hd", "bd", "sq", "mid", "wav", "pss"]
+        .contains(&lower.rsplit('.').next().unwrap_or(""))
+        || source_sidecar(source, key)
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn collect_source(
+    source: &super::archive::SourceTree,
+    phase: &Phase,
+) -> CoreResult<BTreeMap<String, Vec<u8>>> {
+    let mut sources = Vec::new();
+    for name in source.names() {
+        let key = name.to_ascii_lowercase();
+        if key == "sound/sound.dat" || key == "sound/sound.hd3" || key.ends_with(".pss") {
+            continue;
+        }
+        let sidecar = source_sidecar(source, name);
+        sources.push((key, name, sidecar));
+    }
+    sources.sort();
+    let parts = sources
+        .par_iter()
+        .map(
+            |(key, name, sidecar)| -> CoreResult<BTreeMap<String, Vec<u8>>> {
+                let b = source.read(name)?;
+                phase.inc(1);
+                let mut local = BTreeMap::new();
+                if *sidecar {
+                    local.insert(key.clone(), b);
+                } else {
+                    expand(key, b, &mut local, 0)?;
+                }
+                Ok(local)
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut files = BTreeMap::new();
+    for part in parts {
+        files.extend(part?);
+    }
+    Ok(files)
+}
+/// Relative output paths that converting `key` with contents `b` writes under data.
+fn outputs(key: &str, b: &[u8]) -> Vec<String> {
+    if key == "snd2/rev.bin" {
+        vec!["snd2/rev.json".into()]
+    } else if key == "snd2/map_index.txt" {
+        vec!["snd2/map_index.json".into()]
+    } else if key.ends_with(".hd") {
+        let vags = chunk(b, b"Vagi").and_then(entries).unwrap_or_default();
+        let mut out = vec![path(key, "bank.json")];
+        out.extend(
+            vags.iter()
+                .enumerate()
+                .filter(|(_, p)| !p.is_empty())
+                .map(|(i, _)| path(key, &format!("sample-{i}.wav"))),
+        );
+        out
+    } else if key.ends_with(".sq") || key.ends_with(".mid") {
+        vec![path(key, "sequence.json")]
+    } else if key.ends_with(".cfg") {
+        vec![path(key, "config.json")]
+    } else if key.ends_with(".vol") {
+        vec![path(key, "volume.json")]
+    } else if key.ends_with(".wav") || b.starts_with(b"SShd") || b.starts_with(b"RIFF") {
+        vec![format!("{}.wav", key.trim_end_matches(".wav"))]
+    } else if key.ends_with(".pss") {
+        vec![movie_target(key)]
+    } else {
+        vec![]
+    }
 }
 fn expand(
     key: &str,
@@ -1084,15 +1501,18 @@ fn expand(
     Ok(())
 }
 
-fn read_source(raw: &Path, key: &str) -> CoreResult<Vec<u8>> {
+fn read_source(source: &super::archive::SourceTree, key: &str) -> CoreResult<Vec<u8>> {
     let components: Vec<_> = key.split('/').collect();
-    let mut physical = raw.to_path_buf();
+    let mut physical = String::new();
     for (i, component) in components.iter().enumerate() {
-        physical.push(component);
-        if !physical.is_file() {
+        if !physical.is_empty() {
+            physical.push('/');
+        }
+        physical.push_str(component);
+        if !source.contains(&physical) {
             continue;
         }
-        let mut bytes = fs::read(&physical)?;
+        let mut bytes = source.read(&physical)?;
         for name in &components[i + 1..] {
             let members =
                 pack(&bytes).ok_or_else(|| fail(format!("source is not an archive: {key}")))?;
@@ -1107,12 +1527,61 @@ fn read_source(raw: &Path, key: &str) -> CoreResult<Vec<u8>> {
     Err(fail(format!("source file missing: {key}")))
 }
 
-/// Publishes directly addressed sound bundles, recordings, and self-contained movies.
+/// Result of converting one source key, applied to the shared maps in key order.
+enum Outcome {
+    None,
+    Bank(String, String, Value),
+    Sequence(String, Value),
+    Config(String, Value),
+    Volume(String, Value),
+    Stream(String, Value),
+    Movie(String, String),
+}
+
+/// Planned sound bundle document and the config rewritten alongside it.
+struct Bundle {
+    config_path: String,
+    config: Value,
+    path: String,
+    document: Value,
+}
+
+/// Publishes directly addressed sound bundles, recordings, and self-contained movies, then strips them.
 pub fn convert_tree(raw: &Path, published: &Path, _jobs: usize) -> CoreResult<()> {
-    let assets = published.join("port_data");
+    let source = super::archive::SourceTree::directory(raw)?;
+    convert_source(&source, published, &Phase::noop())?;
+    strip_source(&source, published, &Phase::noop())
+}
+
+/// Publishes directly addressed sound bundles, recordings, and self-contained movies into data.
+pub fn convert_assets(raw: &Path, published: &Path, phase: &Phase) -> CoreResult<()> {
+    convert_source(
+        &super::archive::SourceTree::directory(raw)?,
+        published,
+        phase,
+    )
+}
+
+pub fn convert_source(
+    source: &super::archive::SourceTree,
+    published: &Path,
+    phase: &Phase,
+) -> CoreResult<()> {
+    let source_count = source.names().count() as u64;
+    let movie_count = source
+        .names()
+        .filter(|name| name.to_ascii_lowercase().ends_with(".pss"))
+        .count() as u64;
+    // Expansion of nested sound members varies by disc; reserve the observed
+    // work of two passes and complete the remaining budget when publication ends.
+    let total = source_count
+        .saturating_mul(2)
+        .saturating_add(movie_count)
+        .max(1);
+    phase.set_total(total);
+    let assets = published.join("data");
     let published_assets = assets.as_path();
-    let mut files = BTreeMap::new();
-    collect(raw, raw, &mut files)?;
+    let files = collect_source(source, phase)?;
     let (mut banks, mut sequences, mut streams, mut movies) = (
         BTreeMap::new(),
         BTreeMap::new(),
@@ -1120,8 +1589,8 @@ pub fn convert_tree(raw: &Path, published: &Path, _jobs: usize) -> CoreResult<()
         BTreeMap::new(),
     );
     let (mut configs, mut volumes) = (BTreeMap::new(), BTreeMap::new());
-    for (key, b) in &files {
-        let result = (|| -> CoreResult<()> {
+    let convert = |(key, b): (&String, &Vec<u8>)| -> CoreResult<Outcome> {
+        let result = (|| -> CoreResult<Outcome> {
             if key == "snd2/rev.bin" {
                 write_json(published_assets, "snd2/rev.json", &scene_reverb(b)?)?;
             } else if key == "snd2/map_index.txt" {
@@ -1145,35 +1614,109 @@ pub fn convert_tree(raw: &Path, published: &Path, _jobs: usize) -> CoreResult<()
                     })
                     .ok_or_else(|| fail("bank BD companion missing"))?;
                 let document = Value::String(bank(published_assets, key, b, bd)?);
-                banks.insert(key.clone(), document.clone());
-                banks.insert(bd_key, document);
+                return Ok(Outcome::Bank(key.clone(), bd_key, document));
             } else if key.ends_with(".sq") {
-                sequences.insert(
+                return Ok(Outcome::Sequence(
                     key.clone(),
                     Value::String(sequence(published_assets, key, b)?),
-                );
+                ));
             } else if key.ends_with(".mid") {
-                sequences.insert(key.clone(), Value::String(smf(published_assets, key, b)?));
+                return Ok(Outcome::Sequence(
+                    key.clone(),
+                    Value::String(smf(published_assets, key, b)?),
+                ));
             } else if key.ends_with(".cfg") {
-                configs.insert(
+                return Ok(Outcome::Config(
                     key.clone(),
                     Value::String(sound_metadata(published_assets, key, b, false)?),
-                );
+                ));
             } else if key.ends_with(".vol") {
-                volumes.insert(
+                return Ok(Outcome::Volume(
                     key.clone(),
                     Value::String(sound_metadata(published_assets, key, b, true)?),
-                );
+                ));
             } else if key.ends_with(".wav") || b.starts_with(b"SShd") || b.starts_with(b"RIFF") {
+                phase.item(key);
                 let target = format!("{}.wav", key.trim_end_matches(".wav"));
                 write(published_assets, &target, &stream(b)?)?;
-                streams.insert(key.clone(), Value::String(target));
+                return Ok(Outcome::Stream(key.clone(), Value::String(target)));
             } else if key.ends_with(".pss") {
-                movies.insert(key.clone(), movie_mp4(published_assets, key, b)?);
+                phase.item(key);
+                let _slot = FfmpegSlot::acquire();
+                return Ok(Outcome::Movie(
+                    key.clone(),
+                    movie_mp4(published_assets, key, b)?,
+                ));
             }
-            Ok(())
+            Ok(Outcome::None)
         })();
-        result.map_err(|e| fail(format!("{key}: {e}")))?;
+        phase.inc(1);
+        result.map_err(|e| fail(format!("{key}: {e}")))
+    };
+    let mut owners: BTreeMap<String, &str> = BTreeMap::new();
+    let disjoint = files.iter().all(|(key, b)| {
+        outputs(key, b).into_iter().all(|out| {
+            owners
+                .insert(out, key.as_str())
+                .is_none_or(|owner| owner == key.as_str())
+        })
+    });
+    let outcomes: Vec<CoreResult<Outcome>> = if disjoint {
+        files.par_iter().map(convert).collect()
+    } else {
+        files
+            .iter()
+            .map(convert)
+            .scan(false, |failed, outcome| {
+                if *failed {
+                    return None;
+                }
+                *failed = outcome.is_err();
+                Some(outcome)
+            })
+            .collect()
+    };
+    for outcome in outcomes {
+        match outcome? {
+            Outcome::None => {}
+            Outcome::Bank(key, bd_key, document) => {
+                banks.insert(key, document.clone());
+                banks.insert(bd_key, document);
+            }
+            Outcome::Sequence(key, document) => {
+                sequences.insert(key, document);
+            }
+            Outcome::Config(key, document) => {
+                configs.insert(key, document);
+            }
+            Outcome::Volume(key, document) => {
+                volumes.insert(key, document);
+            }
+            Outcome::Stream(key, document) => {
+                streams.insert(key, document);
+            }
+            Outcome::Movie(key, document) => {
+                movies.insert(key, document);
+            }
+        }
+    }
+    let direct_movies: Vec<&str> = source
+        .names()
+        .filter(|name| name.to_ascii_lowercase().ends_with(".pss"))
+        .collect();
+    let converted_movies: Vec<CoreResult<(String, String)>> = direct_movies
+        .par_iter()
+        .map(|name| {
+            let _slot = FfmpegSlot::acquire();
+            let bytes = source.read(name)?;
+            let target = movie_mp4(published_assets, name, &bytes)?;
+            phase.inc(1);
+            Ok((name.to_string(), target))
+        })
+        .collect();
+    for movie in converted_movies {
+        let (name, target) = movie?;
+        movies.insert(name, target);
     }
     let mut groups = BTreeSet::new();
     for key in files.keys() {
@@ -1181,8 +1724,8 @@ pub fn convert_tree(raw: &Path, published: &Path, _jobs: usize) -> CoreResult<()
             groups.insert(format!("{prefix}.snd"));
         }
     }
-    for group in groups {
-        let original = read_source(raw, &group)?;
+    let plan_group = |group: &String| -> CoreResult<Bundle> {
+        let original = read_source(source, group)?;
         let members = pack(&original).ok_or_else(|| fail("sound bundle is not a PACK"))?;
         let mut sequence_refs = Vec::new();
         let mut effect_refs = Vec::new();
@@ -1219,8 +1762,8 @@ pub fn convert_tree(raw: &Path, published: &Path, _jobs: usize) -> CoreResult<()
         if config_ref.is_null() || volume_ref.is_null() {
             return Err(fail(format!("{group}: sound controls missing")));
         }
-        let config_path = config_ref.as_str().unwrap();
-        let mut config: Value = serde_json::from_slice(&fs::read(assets.join(config_path))?)?;
+        let config_path = config_ref.as_str().unwrap().to_owned();
+        let mut config: Value = serde_json::from_slice(&fs::read(assets.join(&config_path))?)?;
         for entry in config["entries"].as_array_mut().unwrap() {
             if let Some(uri) = entry["filename"]
                 .as_str()
@@ -1234,75 +1777,132 @@ pub fn convert_tree(raw: &Path, published: &Path, _jobs: usize) -> CoreResult<()
                 entry["filename"] = json!("");
             }
         }
-        write_json(&assets, config_path, &config)?;
-        write_json(
-            &assets,
-            &format!("{}.sound.json", group.trim_end_matches(".snd")),
-            &json!({"schema_version":1,"kind":"sound_bundle","bank":bank_ref,"sequences":sequence_refs,"effect_sequences":effect_refs,"config":config_ref,"volume":volume_ref}),
-        )?;
+        let path = format!("{}.sound.json", group.trim_end_matches(".snd"));
+        let document = json!({"schema_version":1,"kind":"sound_bundle","bank":bank_ref,"sequences":sequence_refs,"effect_sequences":effect_refs,"config":config_ref,"volume":volume_ref});
+        Ok(Bundle {
+            config_path,
+            config,
+            path,
+            document,
+        })
+    };
+    let group_refs: Vec<&String> = groups.iter().collect();
+    let bundles: Vec<CoreResult<Bundle>> = group_refs
+        .par_iter()
+        .map(|group| plan_group(group))
+        .collect();
+    let disjoint = bundles.iter().all(Result::is_ok) && {
+        let mut written = BTreeSet::new();
+        bundles
+            .iter()
+            .flatten()
+            .all(|bundle| written.insert(&bundle.config_path) && written.insert(&bundle.path))
+    };
+    let write_bundle = |bundle: &Bundle| -> CoreResult<()> {
+        write_json(&assets, &bundle.config_path, &bundle.config)?;
+        write_json(&assets, &bundle.path, &bundle.document)
+    };
+    if disjoint {
+        bundles
+            .into_par_iter()
+            .map(|bundle| -> CoreResult<()> {
+                write_bundle(&bundle?)?;
+                phase.inc(1);
+                Ok(())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<CoreResult<()>>()?;
+    } else {
+        for group in &group_refs {
+            write_bundle(&plan_group(group)?)?;
+            phase.inc(1);
+        }
     }
-    strip_tree(raw, raw, &published.join("data"))
+    phase.set_done(total);
+    Ok(())
 }
 
-fn strip_tree(raw: &Path, dir: &Path, output: &Path) -> CoreResult<()> {
-    for entry in fs::read_dir(dir)? {
-        let p = entry?.path();
-        if p.is_dir() {
-            strip_tree(raw, &p, output)?;
-            continue;
-        }
-        let relative = p.strip_prefix(raw).unwrap();
-        let key = relative
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        let destination = output.join(relative);
-        if matches!(
-            key.as_str(),
-            "sound/sound.dat" | "sound/sound.hd3" | "snd2/rev.bin" | "snd2/map_index.txt"
-        ) {
-            if destination.exists() {
-                fs::remove_file(destination)?;
-            }
-            continue;
-        }
-        if ["snd", "hd", "bd", "sq", "mid", "wav", "pss"]
-            .contains(&key.rsplit('.').next().unwrap_or(""))
-        {
-            if destination.exists() {
-                fs::remove_file(destination)?;
-            }
-            continue;
-        }
-        if ["cfg", "vol"].contains(&p.extension().and_then(|s| s.to_str()).unwrap_or(""))
-            && ["hd", "sq", "mid"]
-                .iter()
-                .any(|ext| p.with_extension(ext).is_file())
-        {
-            if destination.exists() {
-                fs::remove_file(destination)?;
-            }
-            continue;
-        }
-        // Model and texture passes may already have removed a whole converted source.
-        if !destination.is_file() {
-            continue;
-        }
-        let original = fs::read(&p)?;
-        if original.starts_with(b"SShd")
-            || (original.starts_with(b"RIFF") && original.get(8..12) == Some(b"WAVE"))
-        {
+/// Removes or zeros the audio payloads `convert_assets` published from the data tree.
+pub fn strip_data(raw: &Path, published: &Path, phase: &Phase) -> CoreResult<()> {
+    strip_source(
+        &super::archive::SourceTree::directory(raw)?,
+        published,
+        phase,
+    )
+}
+
+pub fn strip_source(
+    source: &super::archive::SourceTree,
+    published: &Path,
+    phase: &Phase,
+) -> CoreResult<()> {
+    let mut found: Vec<&str> = source.names().collect();
+    found.sort();
+    phase.add_total(found.len() as u64);
+    let output = published.join("data");
+    found
+        .par_iter()
+        .map(|p| {
+            let result = strip_one(source, p, &output);
+            phase.inc(1);
+            result
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn strip_one(source: &super::archive::SourceTree, p: &str, output: &Path) -> CoreResult<()> {
+    let key = p.to_ascii_lowercase();
+    let published = output
+        .parent()
+        .ok_or_else(|| fail("missing published root"))?;
+    let destination = super::archive::compatibility_path(published, p);
+    if matches!(
+        key.as_str(),
+        "sound/sound.dat" | "sound/sound.hd3" | "snd2/rev.bin" | "snd2/map_index.txt"
+    ) {
+        if destination.is_file() {
             fs::remove_file(destination)?;
-            continue;
         }
-        if pack(&original).is_some() {
-            let mut current = fs::read(&destination)?;
-            strip_pack(&original, &mut current, 0)?;
-            fs::write(destination, current)?;
+        return Ok(());
+    }
+    if ["snd", "hd", "bd", "sq", "mid", "pss"].contains(&key.rsplit('.').next().unwrap_or("")) {
+        if destination.is_file() {
+            fs::remove_file(destination)?;
         }
+        return Ok(());
+    }
+    if source_sidecar(source, p) {
+        if destination.is_file() {
+            fs::remove_file(destination)?;
+        }
+        return Ok(());
+    }
+    if key.ends_with(".wav") {
+        // The converted PCM stream replaces this source at the same path.
+        return Ok(());
+    }
+    // Model and texture passes may already have removed a whole converted source.
+    if !destination.is_file() {
+        return Ok(());
+    }
+    let original = source.read(p)?;
+    if original.starts_with(b"SShd")
+        || (original.starts_with(b"RIFF") && original.get(8..12) == Some(b"WAVE"))
+    {
+        fs::remove_file(destination)?;
+        return Ok(());
+    }
+    if pack(&original).is_some() {
+        let mut current = fs::read(&destination)?;
+        strip_pack(&original, &mut current, 0)?;
+        fs::write(destination, current)?;
     }
     Ok(())
 }
+
 fn strip_pack(original: &[u8], current: &mut [u8], depth: usize) -> CoreResult<()> {
     if depth > 8 {
         return Err(fail("audio PACK nesting exceeds 8"));
@@ -1329,14 +1929,12 @@ fn strip_pack(original: &[u8], current: &mut [u8], depth: usize) -> CoreResult<(
                 .get_mut(cursor + offset..cursor + offset + b.len())
                 .ok_or_else(|| fail("published PACK payload missing"))?
                 .fill(0);
-        } else if pack(b).is_some() {
-            if u32le(current, cursor + 68)? as usize == b.len() {
-                strip_pack(
-                    b,
-                    &mut current[cursor + offset..cursor + offset + b.len()],
-                    depth + 1,
-                )?;
-            }
+        } else if pack(b).is_some() && u32le(current, cursor + 68)? as usize == b.len() {
+            strip_pack(
+                b,
+                &mut current[cursor + offset..cursor + offset + b.len()],
+                depth + 1,
+            )?;
         }
         cursor += u32le(original, cursor + 72)? as usize;
     }
@@ -1363,146 +1961,268 @@ fn strip_movie_audio(b: &[u8]) -> CoreResult<Vec<u8>> {
 
 /// Audits directly addressed native audio resources and their dependencies.
 pub fn verify(root: &Path) -> CoreResult<()> {
-    let assets = root.join("port_data");
+    let assets = root.join("data");
     if !assets.is_dir() {
         return Ok(());
     }
-    let mut inventory =
-        json!({"banks":{},"sequences":{},"streams":{},"movies":{},"configs":{},"volumes":{}});
-    fn inventory_tree(root: &Path, dir: &Path, inventory: &mut Value) -> CoreResult<()> {
-        for entry in fs::read_dir(dir)? {
-            let p = entry?.path();
-            if p.is_dir() {
-                inventory_tree(root, &p, inventory)?;
-                continue;
-            }
-            let name = p
-                .strip_prefix(root)
+    let mut found = Vec::new();
+    files_under(&assets, &mut found)?;
+    let names: BTreeSet<String> = found
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&assets)
                 .unwrap()
                 .to_string_lossy()
-                .replace('\\', "/");
-            if matches!(
-                name.to_ascii_lowercase().as_str(),
-                "snd2/rev.bin" | "snd2/map_index.txt"
-            ) {
-                return Err(fail(format!(
-                    "proprietary scene audio table published: {name}"
-                )));
-            }
-            if name == "audio_catalog.json" {
-                return Err(fail("obsolete audio catalog published"));
-            }
-            if name.ends_with(".wav") {
-                inventory["streams"][&name] = json!(name);
-            }
-            if name.ends_with(".mp4") {
-                inventory["movies"][&name] = json!({"mp4":name});
-            }
-            if !name.ends_with(".json") {
-                continue;
-            }
-            let bytes = fs::read(&p)?;
-            let document = match serde_json::from_slice::<Value>(&bytes) {
-                Ok(document) => document,
-                Err(error) => {
-                    if name.ends_with(".sound.json")
-                        || name.contains(".sound/")
-                        || matches!(name.as_str(), "snd2/rev.json" | "snd2/map_index.json")
-                    {
-                        return Err(error.into());
-                    }
-                    continue;
+                .replace('\\', "/")
+        })
+        .collect();
+    verify_files(root, &names, &Phase::noop())
+}
+
+/// Counts audio inventory and semantic checks in a staged data tree.
+pub fn verify_work(names: &BTreeSet<String>) -> u64 {
+    let candidates = names.iter().filter(|name| {
+        name.ends_with(".wav")
+            || name.ends_with(".mp4")
+            || name.ends_with(".sound.json")
+            || name.contains(".sound/") && name.ends_with(".json")
+    });
+    names.len() as u64 * 2 + candidates.count() as u64
+}
+
+/// Verifies audio against a previously collected data-tree inventory.
+pub fn verify_files(root: &Path, names: &BTreeSet<String>, phase: &Phase) -> CoreResult<()> {
+    let assets = root.join("data");
+    if !assets.is_dir() {
+        return Ok(());
+    }
+    struct DirectoryView(PathBuf, Vec<String>);
+    impl super::publish::ArchiveReader for DirectoryView {
+        fn names(&self) -> Vec<String> {
+            self.1.clone()
+        }
+        fn contains(&self, name: &str) -> bool {
+            self.0.join(name).is_file()
+        }
+        fn read(&self, name: &str) -> CoreResult<Vec<u8>> {
+            Ok(fs::read(self.0.join(name))?)
+        }
+    }
+    verify_reader(
+        &DirectoryView(assets, names.iter().cloned().collect()),
+        Some(&root.join("config")),
+        names,
+        phase,
+    )
+}
+
+/// Validates audio documents and media directly from the finished asset archive.
+pub fn verify_archive(reader: &dyn super::publish::ArchiveReader, phase: &Phase) -> CoreResult<()> {
+    let names = reader.names().into_iter().collect();
+    verify_reader(reader, None, &names, phase)
+}
+
+fn verify_reader(
+    reader: &dyn super::publish::ArchiveReader,
+    gameplay_root: Option<&Path>,
+    names: &BTreeSet<String>,
+    phase: &Phase,
+) -> CoreResult<()> {
+    let mut inventory =
+        json!({"banks":{},"sequences":{},"streams":{},"movies":{},"configs":{},"volumes":{}});
+    fn document_category(
+        reader: &dyn super::publish::ArchiveReader,
+        gameplay_root: Option<&Path>,
+        name: &str,
+    ) -> CoreResult<Option<&'static str>> {
+        if !name.ends_with(".json") {
+            return Ok(None);
+        }
+        let bytes = asset(reader, gameplay_root, name)?;
+        let name = name.strip_prefix("gameplay/").unwrap_or(name);
+        let document = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(document) => document,
+            Err(error) => {
+                if name.ends_with(".sound.json")
+                    || name.contains(".sound/")
+                    || matches!(name, "snd2/rev.json" | "snd2/map_index.json")
+                {
+                    return Err(error.into());
                 }
-            };
-            if name == "snd2/rev.json" || name == "snd2/map_index.json" {
-                verify_scene_table(
-                    &document,
-                    if name == "snd2/rev.json" {
-                        "scene_reverb"
-                    } else {
-                        "scene_sound_routes"
-                    },
-                )?;
-                continue;
+                return Ok(None);
             }
-            let expected_kind = if name.ends_with(".sound.json") {
-                Some("sound_bundle")
-            } else if name.contains(".sound/") {
-                if name.ends_with("/bank.json") {
-                    Some("bank")
-                } else if name.ends_with("/config.json") {
-                    Some("sound_config")
-                } else if name.ends_with("/volume.json") {
-                    Some("sound_volume")
-                } else if name.contains("/sequences/") {
-                    Some("sequence")
-                } else if name.contains("/effects/") {
-                    Some("effect_sequence")
+        };
+        if name == "snd2/rev.json" || name == "snd2/map_index.json" {
+            verify_scene_table(
+                &document,
+                if name == "snd2/rev.json" {
+                    "scene_reverb"
                 } else {
-                    None
-                }
+                    "scene_sound_routes"
+                },
+            )?;
+            return Ok(None);
+        }
+        let expected_kind = if name.ends_with(".sound.json") {
+            Some("sound_bundle")
+        } else if name.contains(".sound/") {
+            if name.ends_with("/bank.json") {
+                Some("bank")
+            } else if name.ends_with("/config.json") {
+                Some("sound_config")
+            } else if name.ends_with("/volume.json") {
+                Some("sound_volume")
+            } else if name.contains("/sequences/") {
+                Some("sequence")
+            } else if name.contains("/effects/") {
+                Some("effect_sequence")
             } else {
                 None
-            };
-            if expected_kind.is_some_and(|kind| document["kind"] != kind) {
-                return Err(fail(format!("invalid native audio document kind: {name}")));
             }
-            let category = match document["kind"].as_str().unwrap_or("") {
-                "bank" => "banks",
-                "sequence" | "effect_sequence" => "sequences",
-                "sound_config" => "configs",
-                "sound_volume" => "volumes",
-                "sound_bundle" => {
-                    if document["schema_version"] != 1 {
-                        return Err(fail("invalid sound bundle version"));
-                    }
-                    for field in ["bank", "config", "volume"] {
-                        if field == "bank" && document[field].is_null() {
-                            continue;
-                        }
-                        let uri = document[field]
-                            .as_str()
-                            .ok_or_else(|| fail("sound bundle reference missing"))?;
-                        let dependency: Value = serde_json::from_slice(&asset(root, uri)?)?;
-                        let kind = match field {
-                            "bank" => "bank",
-                            "config" => "sound_config",
-                            _ => "sound_volume",
-                        };
-                        if dependency["schema_version"] != 1 || dependency["kind"] != kind {
-                            return Err(fail("invalid sound bundle dependency"));
-                        }
-                    }
-                    for (field, kind) in [
-                        ("sequences", "sequence"),
-                        ("effect_sequences", "effect_sequence"),
-                    ] {
-                        for uri in document[field]
-                            .as_array()
-                            .ok_or_else(|| fail("sound bundle sequence list missing"))?
-                        {
-                            let dependency: Value = serde_json::from_slice(&asset(
-                                root,
-                                uri.as_str().ok_or_else(|| fail("invalid sequence URI"))?,
-                            )?)?;
-                            if dependency["schema_version"] != 1 || dependency["kind"] != kind {
-                                return Err(fail("invalid sound sequence dependency"));
-                            }
-                        }
-                    }
-                    continue;
+        } else {
+            None
+        };
+        if expected_kind.is_some_and(|kind| document["kind"] != kind) {
+            return Err(fail(format!("invalid native audio document kind: {name}")));
+        }
+        let category = match document["kind"].as_str().unwrap_or("") {
+            "bank" => "banks",
+            "sequence" | "effect_sequence" => "sequences",
+            "sound_config" => "configs",
+            "sound_volume" => "volumes",
+            "sound_bundle" => {
+                if document["schema_version"] != 1 {
+                    return Err(fail("invalid sound bundle version"));
                 }
-                _ => continue,
-            };
+                for field in ["bank", "config", "volume"] {
+                    if field == "bank" && document[field].is_null() {
+                        continue;
+                    }
+                    let uri = document[field]
+                        .as_str()
+                        .ok_or_else(|| fail("sound bundle reference missing"))?;
+                    let dependency: Value =
+                        serde_json::from_slice(&asset(reader, gameplay_root, uri)?)?;
+                    let kind = match field {
+                        "bank" => "bank",
+                        "config" => "sound_config",
+                        _ => "sound_volume",
+                    };
+                    if dependency["schema_version"] != 1 || dependency["kind"] != kind {
+                        return Err(fail("invalid sound bundle dependency"));
+                    }
+                }
+                for (field, kind) in [
+                    ("sequences", "sequence"),
+                    ("effect_sequences", "effect_sequence"),
+                ] {
+                    for uri in document[field]
+                        .as_array()
+                        .ok_or_else(|| fail("sound bundle sequence list missing"))?
+                    {
+                        let dependency: Value = serde_json::from_slice(&asset(
+                            reader,
+                            gameplay_root,
+                            uri.as_str().ok_or_else(|| fail("invalid sequence URI"))?,
+                        )?)?;
+                        if dependency["schema_version"] != 1 || dependency["kind"] != kind {
+                            return Err(fail("invalid sound sequence dependency"));
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(category))
+    }
+    fn scan_file(
+        reader: &dyn super::publish::ArchiveReader,
+        gameplay_root: Option<&Path>,
+        name: &str,
+    ) -> CoreResult<(String, Option<&'static str>)> {
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "snd2/rev.bin" | "snd2/map_index.txt"
+        ) {
+            return Err(fail(format!(
+                "proprietary scene audio table published: {name}"
+            )));
+        }
+        if name == "audio_catalog.json" {
+            return Err(fail("obsolete audio catalog published"));
+        }
+        let category = document_category(reader, gameplay_root, name)?;
+        Ok((name.to_owned(), category))
+    }
+    let scanned: Vec<CoreResult<(String, Option<&'static str>)>> = names
+        .par_iter()
+        .map(|name| {
+            let result = scan_file(reader, gameplay_root, name);
+            phase.inc(1);
+            result
+        })
+        .collect();
+    for entry in scanned {
+        let (name, category) = entry?;
+        if name.ends_with(".wav") {
+            inventory["streams"][&name] = json!(name);
+        }
+        if name.ends_with(".mp4") {
+            inventory["movies"][&name] = json!({"mp4":name});
+        }
+        if let Some(category) = category {
             inventory[category][&name] = json!(name);
         }
-        Ok(())
     }
-    inventory_tree(&assets, &assets, &mut inventory)?;
-    if assets.join("snd2/rev.json").exists() != assets.join("snd2/map_index.json").exists() {
+    if let Some(gameplay_root) = gameplay_root {
+        for (name, kind) in [
+            ("snd2/rev.json", "scene_reverb"),
+            ("snd2/map_index.json", "scene_sound_routes"),
+        ] {
+            if gameplay_root.join(name).is_file() {
+                let document: Value =
+                    serde_json::from_slice(&asset(reader, Some(gameplay_root), name)?)?;
+                verify_scene_table(&document, kind)?;
+            }
+        }
+        if gameplay_root.is_dir() {
+            let mut loose = Vec::new();
+            files_under(gameplay_root, &mut loose)?;
+            for file in loose {
+                let name = file
+                    .strip_prefix(gameplay_root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let category = if name.ends_with(".sound/config.json") {
+                    Some("configs")
+                } else if name.ends_with(".sound/volume.json") {
+                    Some("volumes")
+                } else {
+                    None
+                };
+                if let Some(category) = category {
+                    if document_category(reader, Some(gameplay_root), &name)? != Some(category) {
+                        return Err(fail(format!(
+                            "invalid loose sound gameplay document: {name}"
+                        )));
+                    }
+                    inventory[category][&name] = json!(name);
+                }
+            }
+        }
+    }
+    if gameplay_root.is_some_and(|root| {
+        root.join("snd2/rev.json").exists() != root.join("snd2/map_index.json").exists()
+    }) {
         return Err(fail("scene audio tables must be published together"));
     }
-    fn asset(root: &Path, name: &str) -> CoreResult<Vec<u8>> {
+    fn asset(
+        reader: &dyn super::publish::ArchiveReader,
+        gameplay_root: Option<&Path>,
+        name: &str,
+    ) -> CoreResult<Vec<u8>> {
         let p = Path::new(name);
         if p.is_absolute()
             || name.contains(['\\', ':', '\0'])
@@ -1511,13 +2231,30 @@ pub fn verify(root: &Path) -> CoreResult<()> {
         {
             return Err(fail("invalid audio asset path"));
         }
-        Ok(fs::read(root.join(p))?)
+        let gameplay = format!("gameplay/{name}");
+        if reader.contains(&gameplay) {
+            reader.read(&gameplay)
+        } else if reader.contains(name) {
+            reader.read(name)
+        } else if let Some(root) = gameplay_root.filter(|_| {
+            name.ends_with(".sound/config.json")
+                || name.ends_with(".sound/volume.json")
+                || matches!(name, "snd2/rev.json" | "snd2/map_index.json")
+        }) {
+            Ok(fs::read(root.join(p))?)
+        } else {
+            Err(fail(format!("audio archive dependency missing: {name}")))
+        }
     }
-    fn check_wave(root: &Path, name: &str) -> CoreResult<usize> {
+    fn check_wave(
+        reader: &dyn super::publish::ArchiveReader,
+        gameplay_root: Option<&Path>,
+        name: &str,
+    ) -> CoreResult<usize> {
         if !name.ends_with(".wav") {
             return Err(fail("audio sample is not WAV"));
         }
-        let b = asset(root, name)?;
+        let b = asset(reader, gameplay_root, name)?;
         if b.get(..4) != Some(b"RIFF")
             || b.get(8..16) != Some(b"WAVEfmt ")
             || u32le(&b, 16)? != 16
@@ -1534,7 +2271,138 @@ pub fn verify(root: &Path) -> CoreResult<()> {
         }
         Ok((b.len() - 44) / (2 * channels))
     }
+    fn check_resource(
+        reader: &dyn super::publish::ArchiveReader,
+        gameplay_root: Option<&Path>,
+        category: &str,
+        name: &str,
+    ) -> CoreResult<()> {
+        if category == "movies" {
+            let b = asset(reader, gameplay_root, name)?;
+            if !name.ends_with(".mp4") || b.get(4..8) != Some(b"ftyp") {
+                return Err(fail("invalid movie MP4 asset"));
+            }
+            let mut at = 0;
+            let mut boxes = BTreeSet::new();
+            while at + 8 <= b.len() {
+                let size = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+                let size = if size == 1 {
+                    u64::from_be_bytes(
+                        b.get(at + 8..at + 16)
+                            .ok_or_else(|| fail("truncated MP4 large box"))?
+                            .try_into()
+                            .unwrap(),
+                    ) as usize
+                } else if size == 0 {
+                    b.len() - at
+                } else {
+                    size
+                };
+                if size < 8 || size > b.len() - at {
+                    return Err(fail("invalid MP4 box size"));
+                }
+                boxes.insert(b[at + 4..at + 8].to_vec());
+                at += size;
+            }
+            if at != b.len()
+                || !boxes.contains(b"moov".as_slice())
+                || !boxes.contains(b"mdat".as_slice())
+            {
+                return Err(fail("incomplete MP4 movie"));
+            }
+            return Ok(());
+        }
+        if category == "streams" {
+            check_wave(reader, gameplay_root, name)?;
+            return Ok(());
+        }
+        let document: Value = serde_json::from_slice(&asset(reader, gameplay_root, name)?)?;
+        if !name.ends_with(".json") || document["schema_version"] != 1 {
+            return Err(fail("unsupported audio document version"));
+        }
+        if category == "banks" {
+            if document["kind"] != "bank"
+                || !document["programs"].is_array()
+                || !document["sample_sets"].is_array()
+                || !document["samples"].is_array()
+            {
+                return Err(fail("invalid bank document"));
+            }
+            for sample in document["vags"]
+                .as_array()
+                .ok_or_else(|| fail("bank sample table missing"))?
+            {
+                if sample.is_null() {
+                    continue;
+                }
+                let frames = check_wave(
+                    reader,
+                    gameplay_root,
+                    sample["wav"]
+                        .as_str()
+                        .ok_or_else(|| fail("bank WAV missing"))?,
+                )?;
+                if sample["loop_start"]
+                    .as_u64()
+                    .is_none_or(|n| n >= frames as u64)
+                    || sample["loop_end"] != frames as u64
+                    || !sample["loops"].is_boolean()
+                {
+                    return Err(fail("invalid sample loop boundary"));
+                }
+            }
+        } else if category == "configs" || category == "volumes" {
+            if document["kind"]
+                != if category == "configs" {
+                    "sound_config"
+                } else {
+                    "sound_volume"
+                }
+                || !document["entries"].is_array()
+                || !document["reverb"].is_array()
+                || (category == "configs" && !document["entry_count"].is_u64())
+            {
+                return Err(fail("invalid sound manager metadata"));
+            }
+        } else if document["kind"] == "sequence" {
+            for song in document["songs"]
+                .as_array()
+                .ok_or_else(|| fail("sequence songs missing"))?
+            {
+                if song["division"].as_u64().is_none_or(|n| n == 0) || !song["events"].is_array() {
+                    return Err(fail("invalid sequence timing"));
+                }
+            }
+        } else if document["kind"] == "effect_sequence" {
+            if !document["events"].is_array()
+                || document["tick_rate"].as_u64().is_none_or(|n| n == 0)
+            {
+                return Err(fail("invalid effect sequence"));
+            }
+        } else {
+            return Err(fail("unknown audio sequence kind"));
+        }
+        Ok(())
+    }
+    fn resource<'a>(
+        category: &str,
+        alias: &str,
+        value: &'a Value,
+        checked: &mut BTreeSet<String>,
+    ) -> CoreResult<Option<&'a str>> {
+        if alias.is_empty() {
+            return Err(fail("empty audio alias"));
+        }
+        let name = if category == "movies" {
+            value["mp4"].as_str()
+        } else {
+            value.as_str()
+        }
+        .ok_or_else(|| fail("invalid audio resource value"))?;
+        Ok(checked.insert(name.to_owned()).then_some(name))
+    }
     let mut checked = BTreeSet::new();
+    let mut items = Vec::new();
     for category in [
         "banks",
         "sequences",
@@ -1543,159 +2411,49 @@ pub fn verify(root: &Path) -> CoreResult<()> {
         "configs",
         "volumes",
     ] {
-        let entries = inventory[category]
-            .as_object()
-            .ok_or_else(|| fail("audio inventory category missing"))?;
+        let Some(entries) = inventory[category].as_object() else {
+            items.push(Err(fail("audio inventory category missing")));
+            continue;
+        };
         for (alias, value) in entries {
-            if alias.is_empty() {
-                return Err(fail("empty audio alias"));
-            }
-            let name = if category == "movies" {
-                value["mp4"].as_str()
-            } else {
-                value.as_str()
-            }
-            .ok_or_else(|| fail("invalid audio resource value"))?;
-            if !checked.insert(name.to_owned()) {
-                continue;
-            }
-            if category == "movies" {
-                let b = asset(&assets, name)?;
-                if !name.ends_with(".mp4") || b.get(4..8) != Some(b"ftyp") {
-                    return Err(fail("invalid movie MP4 asset"));
-                }
-                let mut at = 0;
-                let mut boxes = BTreeSet::new();
-                while at + 8 <= b.len() {
-                    let size = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
-                    let size = if size == 1 {
-                        u64::from_be_bytes(
-                            b.get(at + 8..at + 16)
-                                .ok_or_else(|| fail("truncated MP4 large box"))?
-                                .try_into()
-                                .unwrap(),
-                        ) as usize
-                    } else if size == 0 {
-                        b.len() - at
-                    } else {
-                        size
-                    };
-                    if size < 8 || size > b.len() - at {
-                        return Err(fail("invalid MP4 box size"));
-                    }
-                    boxes.insert(b[at + 4..at + 8].to_vec());
-                    at += size;
-                }
-                if at != b.len()
-                    || !boxes.contains(b"moov".as_slice())
-                    || !boxes.contains(b"mdat".as_slice())
-                {
-                    return Err(fail("incomplete MP4 movie"));
-                }
-                continue;
-            }
-            if category == "streams" {
-                check_wave(&assets, name)?;
-                continue;
-            }
-            let document: Value = serde_json::from_slice(&asset(&assets, name)?)?;
-            if !name.ends_with(".json") || document["schema_version"] != 1 {
-                return Err(fail("unsupported audio document version"));
-            }
-            if category == "banks" {
-                if document["kind"] != "bank"
-                    || !document["programs"].is_array()
-                    || !document["sample_sets"].is_array()
-                    || !document["samples"].is_array()
-                {
-                    return Err(fail("invalid bank document"));
-                }
-                for sample in document["vags"]
-                    .as_array()
-                    .ok_or_else(|| fail("bank sample table missing"))?
-                {
-                    if sample.is_null() {
-                        continue;
-                    }
-                    let frames = check_wave(
-                        &assets,
-                        sample["wav"]
-                            .as_str()
-                            .ok_or_else(|| fail("bank WAV missing"))?,
-                    )?;
-                    if sample["loop_start"]
-                        .as_u64()
-                        .is_none_or(|n| n >= frames as u64)
-                        || sample["loop_end"] != frames as u64
-                        || !sample["loops"].is_boolean()
-                    {
-                        return Err(fail("invalid sample loop boundary"));
-                    }
-                }
-            } else if category == "configs" || category == "volumes" {
-                if document["kind"]
-                    != if category == "configs" {
-                        "sound_config"
-                    } else {
-                        "sound_volume"
-                    }
-                    || !document["entries"].is_array()
-                    || !document["reverb"].is_array()
-                    || (category == "configs" && !document["entry_count"].is_u64())
-                {
-                    return Err(fail("invalid sound manager metadata"));
-                }
-            } else if document["kind"] == "sequence" {
-                for song in document["songs"]
-                    .as_array()
-                    .ok_or_else(|| fail("sequence songs missing"))?
-                {
-                    if song["division"].as_u64().is_none_or(|n| n == 0)
-                        || !song["events"].is_array()
-                    {
-                        return Err(fail("invalid sequence timing"));
-                    }
-                }
-            } else if document["kind"] == "effect_sequence" {
-                if !document["events"].is_array()
-                    || document["tick_rate"].as_u64().is_none_or(|n| n == 0)
-                {
-                    return Err(fail("invalid effect sequence"));
-                }
-            } else {
-                return Err(fail("unknown audio sequence kind"));
+            match resource(category, alias, value, &mut checked) {
+                Ok(Some(name)) => items.push(Ok((category, name))),
+                Ok(None) => {}
+                Err(error) => items.push(Err(error)),
             }
         }
     }
-    fn audit(dir: &Path) -> CoreResult<()> {
-        for entry in fs::read_dir(dir)? {
-            let p = entry?.path();
-            if p.is_dir() {
-                audit(&p)?;
-            } else {
-                let name = p
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_ascii_lowercase();
-                if ["snd", "hd", "bd", "sq", "mid", "wav", "pss"]
-                    .contains(&name.rsplit('.').next().unwrap_or(""))
-                    || name == "sound.dat"
-                    || name == "sound.hd3"
-                    || (p.parent().is_some_and(|parent| parent.ends_with("snd2"))
-                        && matches!(name.as_str(), "rev.bin" | "map_index.txt"))
-                {
-                    return Err(fail(format!("retail audio remains: {}", p.display())));
-                }
-            }
+    let checks: Vec<CoreResult<()>> = items
+        .par_iter()
+        .map(|item| {
+            let result = match item {
+                Ok((category, name)) => check_resource(reader, gameplay_root, category, name),
+                Err(_) => Ok(()),
+            };
+            phase.inc(1);
+            result
+        })
+        .collect();
+    let checked_items = items.len() as u64;
+    for (item, check) in items.into_iter().zip(checks) {
+        item?;
+        check?;
+    }
+    let candidates = verify_work(names) - names.len() as u64 * 2;
+    phase.inc(candidates.saturating_sub(checked_items));
+    for name in names {
+        let lower = name.to_ascii_lowercase();
+        let basename = lower.rsplit('/').next().unwrap_or("");
+        if ["snd", "hd", "bd", "sq", "mid", "pss"]
+            .contains(&basename.rsplit('.').next().unwrap_or(""))
+            || matches!(basename, "sound.dat" | "sound.hd3")
+            || (lower.starts_with("snd2/") && matches!(basename, "rev.bin" | "map_index.txt"))
+        {
+            return Err(fail(format!("retail audio remains: {name}")));
         }
-        Ok(())
+        phase.inc(1);
     }
-    if root.join("data").is_dir() {
-        audit(&root.join("data"))
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1708,8 +2466,7 @@ mod tests {
         let output = std::path::PathBuf::from(
             std::env::var_os("KZ_AUDIO_META_OUTPUT").expect("KZ_AUDIO_META_OUTPUT"),
         );
-        let mut files = BTreeMap::new();
-        collect(&raw, &raw, &mut files).unwrap();
+        let files = collect(&raw, &Phase::noop()).unwrap();
         let mut configs = BTreeMap::new();
         let mut volumes = BTreeMap::new();
         let mut records = 0;
@@ -1792,12 +2549,10 @@ mod tests {
         convert_tree(&raw, &output, 1).unwrap();
         verify(&output).unwrap();
         let reverbs: Value =
-            serde_json::from_slice(&fs::read(output.join("port_data/snd2/rev.json")).unwrap())
+            serde_json::from_slice(&fs::read(output.join("data/snd2/rev.json")).unwrap()).unwrap();
+        let routes: Value =
+            serde_json::from_slice(&fs::read(output.join("data/snd2/map_index.json")).unwrap())
                 .unwrap();
-        let routes: Value = serde_json::from_slice(
-            &fs::read(output.join("port_data/snd2/map_index.json")).unwrap(),
-        )
-        .unwrap();
         assert_eq!(reverbs["rows"].as_array().unwrap().len(), 53);
         assert_eq!(reverbs["rows"][52], json!({"id":52,"type":4,"depth":53}));
         assert_eq!(routes["rows"][0]["env_vol"], 12);
@@ -1817,7 +2572,7 @@ mod tests {
         assert!(!output.join("data/snd2/rev.bin").exists());
         assert!(!output.join("data/snd2/map_index.txt").exists());
         assert!(scene_reverb(&reverb[..423]).is_err());
-        fs::write(output.join("port_data/snd2/rev.json"), b"invalid JSON").unwrap();
+        fs::write(output.join("data/snd2/rev.json"), b"invalid JSON").unwrap();
         assert!(verify(&output).is_err());
     }
     #[test]
@@ -1929,15 +2684,14 @@ mod tests {
         verify(&stage).unwrap();
         assert!(!stage.join("data/test.hd").exists());
         assert!(!stage.join("data/test.bd").exists());
-        let d: Value = serde_json::from_slice(
-            &fs::read(stage.join("port_data/test.sound/bank.json")).unwrap(),
-        )
-        .unwrap();
+        let d: Value =
+            serde_json::from_slice(&fs::read(stage.join("data/test.sound/bank.json")).unwrap())
+                .unwrap();
         assert_eq!(d["programs"][0]["splits"][0]["bend_high"], 384);
         assert_eq!(d["samples"][0]["adsr1"], 0x80ff);
         assert_eq!(d["vags"][0]["loop_end"], 28);
         assert_eq!(d["vags"][0]["loops"], true);
-        fs::write(stage.join("port_data/test.sound/samples/0.wav"), b"bad").unwrap();
+        fs::write(stage.join("data/test.sound/samples/0.wav"), b"bad").unwrap();
         assert!(verify(&stage).is_err());
     }
 
@@ -1956,6 +2710,29 @@ mod tests {
         assert_eq!(d["events"].as_array().unwrap().len(), 3);
         assert_eq!(d["events"][1]["status"], 144);
         assert_eq!(d["events"][1]["delta"], 10);
+    }
+
+    #[test]
+    fn archived_gameplay_scene_tables_validate_their_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        fs::create_dir_all(root.join("gameplay/snd2")).unwrap();
+        let table = root.join("gameplay/snd2/rev.json");
+        let archive_path = temp.path().join("data.zip");
+        for kind in ["scene_reverb", "wrong_kind"] {
+            fs::write(
+                &table,
+                serde_json::to_vec(&json!({"schema_version":1,"kind":kind,"rows":[]})).unwrap(),
+            )
+            .unwrap();
+            super::super::zip_archive::pack_directory(&root, &archive_path).unwrap();
+            let archive = super::super::zip_archive::Archive::open(&archive_path).unwrap();
+            let result = verify_archive(
+                &super::super::publish::ArchiveView::new(&archive),
+                &Phase::noop(),
+            );
+            assert_eq!(result.is_ok(), kind == "scene_reverb");
+        }
     }
 
     #[test]
@@ -1994,23 +2771,37 @@ mod tests {
         convert_tree(&raw, &stage, 1).unwrap();
         verify(&stage).unwrap();
         let bundle: Value =
-            serde_json::from_slice(&fs::read(stage.join("port_data/test.sound.json")).unwrap())
-                .unwrap();
+            serde_json::from_slice(&fs::read(stage.join("data/test.sound.json")).unwrap()).unwrap();
         assert_eq!(
             bundle["effect_sequences"],
             json!(["test.sound/effects/z.json", "test.sound/effects/a.json"])
         );
-        let config: Value = serde_json::from_slice(
-            &fs::read(stage.join("port_data/test.sound/config.json")).unwrap(),
-        )
-        .unwrap();
+        let config: Value =
+            serde_json::from_slice(&fs::read(stage.join("data/test.sound/config.json")).unwrap())
+                .unwrap();
         assert_eq!(
             config["entries"][0]["filename"],
             "test.sound/effects/z.json"
         );
         assert!(!stage.join("data/test.snd").exists());
-        assert!(!stage.join("port_data/audio_catalog.json").exists());
-        fs::remove_file(stage.join("port_data/test.sound/effects/z.json")).unwrap();
+        assert!(!stage.join("data/audio_catalog.json").exists());
+        fs::create_dir_all(stage.join("data/gameplay/test.sound")).unwrap();
+        for name in ["config.json", "volume.json"] {
+            fs::rename(
+                stage.join("data/test.sound").join(name),
+                stage.join("data/gameplay/test.sound").join(name),
+            )
+            .unwrap();
+        }
+        let archive_path = temp.path().join("data.zip");
+        super::super::zip_archive::pack_directory(&stage.join("data"), &archive_path).unwrap();
+        let archive = super::super::zip_archive::Archive::open(&archive_path).unwrap();
+        verify_archive(
+            &super::super::publish::ArchiveView::new(&archive),
+            &Phase::noop(),
+        )
+        .unwrap();
+        fs::remove_file(stage.join("data/test.sound/effects/z.json")).unwrap();
         assert!(verify(&stage).is_err());
     }
     #[test]
