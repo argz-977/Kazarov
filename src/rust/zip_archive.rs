@@ -592,16 +592,27 @@ enum PreparedPayload {
 
 pub(crate) fn prepare_artifact(name: String, bytes: ArtifactBytes) -> CoreResult<PreparedEntry> {
     validate_name(&name)?;
-    let source = bytes.as_slice();
-    let size = source.len() as u64;
-    let crc = crc32fast::hash(source);
-    let sha256 = Sha256::digest(source).into();
-    let (method, payload) = if stored_by_name(&name) {
-        (METHOD_STORED, PreparedPayload::Stored(bytes))
-    } else {
-        let compressed = zstd::bulk::compress(source, ZSTD_LEVEL)
-            .map_err(|error| fail(format!("{name}: {error}")))?;
-        (METHOD_ZSTD, PreparedPayload::Compressed(compressed))
+    // A source range is read only within this scope; a stored one is read again when it is written.
+    let (size, crc, sha256, compressed) = {
+        let source = bytes.as_slice();
+        let compressed = if stored_by_name(&name) {
+            None
+        } else {
+            Some(
+                zstd::bulk::compress(&source, ZSTD_LEVEL)
+                    .map_err(|error| fail(format!("{name}: {error}")))?,
+            )
+        };
+        (
+            source.len() as u64,
+            crc32fast::hash(&source),
+            Sha256::digest(&*source).into(),
+            compressed,
+        )
+    };
+    let (method, payload) = match compressed {
+        None => (METHOD_STORED, PreparedPayload::Stored(bytes)),
+        Some(compressed) => (METHOD_ZSTD, PreparedPayload::Compressed(compressed)),
     };
     Ok(PreparedEntry {
         name,
@@ -642,7 +653,7 @@ impl StreamWriter {
             local,
         ))?;
         match &entry.payload {
-            PreparedPayload::Stored(bytes) => self.0.out.put(bytes.as_slice())?,
+            PreparedPayload::Stored(bytes) => self.0.out.put(&bytes.as_slice())?,
             PreparedPayload::Compressed(bytes) => self.0.out.put(bytes)?,
         }
         self.0.central.push(CentralEntry {
