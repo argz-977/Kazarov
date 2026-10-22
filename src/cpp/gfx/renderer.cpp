@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -1045,6 +1046,13 @@ float LogicalHeight() { return g.config.logical_height; }
 
 LogicalRect LogicalFrame() { return {0.0f, 0.0f, LogicalWidth(), LogicalHeight()}; }
 
+namespace {
+
+// Held by RendererSuspend's caller while the app is in the background.
+std::optional<RenderLease> g_suspend_lease;
+
+} // namespace
+
 void RendererInit(SDL_Window *window, const RendererConfig &config) {
     static uint64_t instances = 0;
     g_validation_messages.store(0);
@@ -1099,6 +1107,7 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
 }
 
 void RendererShutdown() {
+    g_suspend_lease.reset();
     // No idle hook call may start once shutdown begins.
     SetRenderIdleHook(nullptr, nullptr);
     if (g.device == VK_NULL_HANDLE) {
@@ -1156,6 +1165,24 @@ void RendererShutdown() {
 }
 
 void RendererResize() { g_resize_pending.store(true); }
+
+void RendererSuspend() {
+    if (g.device == VK_NULL_HANDLE || g_suspend_lease) {
+        return;
+    }
+    // The lease waits out queued commands and the idle hook's frame, then keeps both from starting.
+    g_suspend_lease.emplace();
+    vkDeviceWaitIdle(g.device);
+}
+
+void RendererResume() {
+    if (!g_suspend_lease) {
+        return;
+    }
+    // The layer's drawables may have changed size or been released while the app was away.
+    g_resize_pending.store(true);
+    g_suspend_lease.reset();
+}
 
 void SetAnisotropy(int samples) {
     RunOnRenderThread([&] {

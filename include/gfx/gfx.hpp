@@ -160,6 +160,12 @@ void SetRenderIdleHook(RenderIdleHook hook, void *user);
 void WakeRenderThread();
 // The window's pixel size changed; the swapchain and main target follow at the next BeginFrame.
 void RendererResize();
+// For an app sent to the background, where iOS refuses GPU work and ends an app that submits it: on the thread
+// that pumps the window's events, parks the render thread and waits for the GPU to finish everything submitted.
+// Until RendererResume, called on the same thread, nothing else may record or present. Resuming recreates the
+// swapchain at the next BeginFrame. Without a device, or already suspended, nothing happens.
+void RendererSuspend();
+void RendererResume();
 // The swapchain is recreated with the mode at the next BeginFrame or tick render.
 void SetPresentMode(PresentMode mode);
 

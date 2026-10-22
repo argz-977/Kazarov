@@ -11,6 +11,8 @@
 
 #include "gfx/gfx.hpp"
 #include "kazarov/log.hpp"
+#include "platform/audio.hpp"
+#include "platform/clock.hpp"
 
 namespace {
 
@@ -48,6 +50,41 @@ void ApplyIcon() {
     kz::Fatal("window", std::format("{}: {}", what, SDL_GetError()), /*unimplemented=*/false);
     std::exit(1);
 }
+
+#ifdef SDL_PLATFORM_IOS
+// Whether the app is in the background, or inactive behind the lock screen or a system panel.
+bool g_background = false;
+
+// UIKit's app delegate sends these from inside an event pump on the game thread, and the watch sees them before
+// the delegate call returns: past that iOS refuses GPU work, and an app that submits it is ended. So everything
+// stops here, not when the queued event is read.
+bool SDLCALL Lifecycle(void *, SDL_Event *event) {
+    switch (event->type) {
+        case SDL_EVENT_WILL_ENTER_BACKGROUND:
+        case SDL_EVENT_DID_ENTER_BACKGROUND:
+            if (!g_background) {
+                g_background = true;
+                kz::Log(kz::LogLevel::Info, "window", "app inactive: rendering and sound paused");
+                gfx::RendererSuspend();
+                AudioOutputPause(true);
+            }
+            break;
+        case SDL_EVENT_DID_ENTER_FOREGROUND:
+            if (g_background) {
+                g_background = false;
+                kz::Log(kz::LogLevel::Info, "window", "app active again: rendering and sound resumed");
+                // The time away is not run as game ticks.
+                ClockReanchor();
+                AudioOutputPause(false);
+                gfx::RendererResume();
+            }
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+#endif
 
 void Check(bool ok, const char *what) {
     if (!ok) {
@@ -101,6 +138,10 @@ void WindowInit(const WindowConfig &config) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         Fatal("SDL_Init");
     }
+#ifdef SDL_PLATFORM_IOS
+    g_background = false;
+    Check(SDL_AddEventWatch(Lifecycle, nullptr), "SDL_AddEventWatch");
+#endif
     // SDL3 backs a Vulkan window on macOS with a CAMetalLayer (VK_EXT_metal_surface) by itself.
     SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (config.vulkan) {
@@ -190,6 +231,9 @@ bool WindowTakeModeEvent() {
 }
 
 void WindowShutdown() {
+#ifdef SDL_PLATFORM_IOS
+    SDL_RemoveEventWatch(Lifecycle, nullptr);
+#endif
     SDL_DestroyWindow(g_window);
     g_window = nullptr;
     g_mode_event = false;
@@ -252,31 +296,48 @@ std::vector<DisplayModeSize> WindowDisplayModes() {
     return sizes;
 }
 
+namespace {
+
+void HandleEvent(const SDL_Event &event, bool &running) {
+    for (auto hook : g_hooks) {
+        hook(event);
+    }
+    switch (event.type) {
+        case SDL_EVENT_QUIT:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            running = false;
+            break;
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+            gfx::RendererResize();
+            g_mode_event = true;
+            break;
+        case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+        case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+        case SDL_EVENT_WINDOW_RESIZED:
+            g_mode_event = true;
+            break;
+        default:
+            break;
+    }
+}
+
+} // namespace
+
 bool WindowPollEvents() {
     bool      running = true;
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-        for (auto hook : g_hooks) {
-            hook(event);
-        }
-        switch (event.type) {
-            case SDL_EVENT_QUIT:
-            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-                running = false;
-                break;
-            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-                gfx::RendererResize();
-                g_mode_event = true;
-                break;
-            case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
-            case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
-            case SDL_EVENT_WINDOW_RESIZED:
-                g_mode_event = true;
-                break;
-            default:
-                break;
+        HandleEvent(event, running);
+    }
+#ifdef SDL_PLATFORM_IOS
+    // In the background the game waits here, with nothing rendered or mixed, until the app is active again.
+    // Waiting pumps events, so UIKit's calls keep arriving.
+    while (g_background && running) {
+        if (SDL_WaitEventTimeout(&event, 250)) {
+            HandleEvent(event, running);
         }
     }
+#endif
     return running;
 }
 
