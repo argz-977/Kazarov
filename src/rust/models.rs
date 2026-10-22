@@ -5159,14 +5159,15 @@ impl ModelPlan {
         let mut owners = BTreeMap::<String, usize>::new();
         let mut icon_names = BTreeSet::new();
         let mut preview_nanos = Vec::with_capacity(native_jobs.len());
-        for (index, (job, result)) in native_jobs.iter().zip(previews).enumerate() {
+        for (index, (job, result)) in native_jobs.iter_mut().zip(previews).enumerate() {
             let (names, local, elapsed) = result?;
             preview_nanos.push(elapsed.as_nanos().max(1));
             for name in names {
                 owners.insert(name, index);
             }
             report.rigs.extend(local.rigs);
-            report.externals.extend(job.externals.iter().cloned());
+            // Moved, not copied: the final jobs read external motions from the report alone.
+            report.externals.append(&mut job.externals);
             report.externals.extend(local.externals);
             report.referenced_pngs.extend(local.referenced_pngs);
             report
