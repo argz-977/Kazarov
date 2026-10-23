@@ -2601,6 +2601,23 @@ struct NativeArtifact {
     packed: Option<PackedNativeArtifact>,
 }
 
+/// A native artifact ready to merge: as it is, or decoded from its packed form for as long as it is needed.
+enum ExpandedArtifact<'a> {
+    Borrowed(&'a NativeArtifact),
+    Owned(NativeArtifact),
+}
+
+impl std::ops::Deref for ExpandedArtifact<'_> {
+    type Target = NativeArtifact;
+
+    fn deref(&self) -> &NativeArtifact {
+        match self {
+            Self::Borrowed(artifact) => artifact,
+            Self::Owned(artifact) => artifact,
+        }
+    }
+}
+
 struct PackedNativeArtifact {
     bytes: super::spill::SpilledBytes,
     decoded_len: usize,
@@ -3261,17 +3278,15 @@ fn publish_native_impl(
     report: &mut ConversionReport,
     mut stream: Option<&mut StreamPairs<'_>>,
 ) -> CoreResult<()> {
-    let decoded = if artifacts.values().any(|artifact| artifact.packed.is_some()) {
-        Some(
-            artifacts
-                .iter()
-                .map(|(name, artifact)| Ok((name.clone(), artifact.expanded()?)))
-                .collect::<CoreResult<BTreeMap<_, _>>>()?,
-        )
-    } else {
-        None
-    };
-    let artifacts = decoded.as_ref().unwrap_or(artifacts);
+    // Packed artifacts are expanded where they are merged, one bundle at a time: a file with many models would
+    // otherwise hold every one of them as JSON values at once, over a gigabyte for the largest.
+    fn expand(artifact: &NativeArtifact) -> CoreResult<ExpandedArtifact<'_>> {
+        Ok(if artifact.packed.is_some() {
+            ExpandedArtifact::Owned(artifact.expanded()?)
+        } else {
+            ExpandedArtifact::Borrowed(artifact)
+        })
+    }
     let characters: Vec<_> = resources
         .iter()
         .filter(|r| is_character(&r.alias))
@@ -3285,6 +3300,7 @@ fn publish_native_impl(
         else {
             continue;
         };
+        let artifact = expand(artifact)?;
         let original = resources
             .iter()
             .find(|resource| resource.alias == *source)
@@ -3355,6 +3371,7 @@ fn publish_native_impl(
             .iter()
             .filter(|(source, _)| character_parent(source) == Some(alias.as_str()))
         {
+            let artifact = expand(artifact)?;
             let offsets = merge_gltf(&mut gltf, &artifact.gltf);
             let model_id = if artifact.metadata["frames"]
                 .as_array()
@@ -3671,7 +3688,11 @@ fn publish_native_impl(
             .or_default()
             .push((alias, artifact));
     }
-    for (path, mut entries) in standalone {
+    for (path, entries) in standalone {
+        let mut entries = entries
+            .into_iter()
+            .map(|(alias, artifact)| Ok((alias, expand(artifact)?)))
+            .collect::<CoreResult<Vec<_>>>()?;
         entries.sort_by_key(|(_, a)| a.metadata["frames"].as_array().is_none_or(Vec::is_empty));
         let mut gltf = empty_gltf();
         let mut metadata = entries[0].1.metadata.clone();
