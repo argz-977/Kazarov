@@ -16,8 +16,8 @@
 
 namespace {
 
-// Android and iOS show the window fullscreen at the display's size, whatever is asked.
-#if defined(__ANDROID__) || defined(SDL_PLATFORM_IOS)
+// Android, iOS and the Switch show the window fullscreen at the display's size, whatever is asked.
+#if defined(__ANDROID__) || defined(SDL_PLATFORM_IOS) || defined(__SWITCH__)
 constexpr bool kFixedWindow = true;
 #else
 constexpr bool kFixedWindow = false;
