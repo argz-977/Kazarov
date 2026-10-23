@@ -998,7 +998,7 @@ pub fn verify_with_progress(root: &Path, phase: &Phase) -> CoreResult<u64> {
             "data.zip is missing or its size does not match data.json",
         ));
     }
-    let archive = Archive::open_sequential(&root.join(ARCHIVE))?;
+    let archive = Archive::open(&root.join(ARCHIVE))?;
     phase.set_total(archive.len() as u64);
     verify_open_archive(&archive, &marker, phase)
 }
@@ -1081,7 +1081,7 @@ pub fn verify_stream_with_progress(
             "data.zip is missing or its size does not match data.json",
         ));
     }
-    let archive = Archive::open_sequential(&root.join(ARCHIVE))?;
+    let archive = Archive::open(&root.join(ARCHIVE))?;
     let view = ArchiveView::new(&archive);
     let archive_names = view.names();
     let names: BTreeSet<String> = archive_names.iter().cloned().collect();

@@ -207,19 +207,12 @@ fn decompress_exact(source: &[u8], out: &mut [u8]) -> CoreResult<()> {
 }
 
 impl Archive {
-    /// Opens and validates an archive's central directory, preferring a memory map.
+    /// Opens and validates an archive's central directory, preferring a memory map. On iOS it is read with
+    /// positioned reads instead: a map of the whole published archive, about 4 GB, takes address space the app
+    /// does not have to spare, so the disc image's mappings during verification or the game's arenas after
+    /// an extraction could no longer be placed.
     pub fn open(path: &Path) -> CoreResult<Archive> {
-        Self::open_with(path, true)
-    }
-
-    /// Opens an archive that is read once from start to end, as verification does. On iOS it is read with
-    /// positioned reads instead of a map: mapping the whole published archive while the disc image is mapped
-    /// takes address space the app does not have, and every later mapping then fails.
-    pub fn open_sequential(path: &Path) -> CoreResult<Archive> {
-        Self::open_with(path, !cfg!(any(target_os = "ios", kazarov_mapped_source)))
-    }
-
-    fn open_with(path: &Path, map: bool) -> CoreResult<Archive> {
+        let map = !cfg!(any(target_os = "ios", kazarov_mapped_source));
         let context = |error: CoreError| fail(format!("{}: {error}", path.display()));
         let file = File::open(path).map_err(|e| context(e.into()))?;
         let length = file.metadata().map_err(|e| context(e.into()))?.len();
@@ -487,10 +480,13 @@ impl Archive {
                 entry.name
             )));
         }
-        let source = self.bytes(entry.data, entry.compressed)?;
-        if entry.method == METHOD_STORED {
-            out.copy_from_slice(&source);
+        if let (Backing::File(file), METHOD_STORED) = (&self.backing, entry.method) {
+            // Straight into the caller's buffer, without a copy of the whole entry in between.
+            read_exact_at(file, out, entry.data)?;
+        } else if entry.method == METHOD_STORED {
+            out.copy_from_slice(&self.bytes(entry.data, entry.compressed)?);
         } else {
+            let source = self.bytes(entry.data, entry.compressed)?;
             decompress_exact(&source, out)
                 .map_err(|e| fail(format!("{}: {}: {e}", self.path.display(), entry.name)))?;
         }
