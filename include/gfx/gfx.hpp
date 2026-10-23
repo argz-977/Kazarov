@@ -109,7 +109,8 @@ struct RendererConfig {
     bool separate_stencil_masks = true;
     // False pushes each draw's texture, palette and sampler, as on a device without the bindless
     // texture array (Apple A12 and older), so that path can be exercised on any device.
-    // KZ_BINDLESS=0 in the environment sets it false.
+    // KZ_BINDLESS=0 in the environment sets it false. A portability-subset device (MoltenVK) pushes
+    // them whatever this says, unless KZ_BINDLESS=1.
     bool bindless_textures = true;
     // Also precompiles the Vu_prog0 pipelines that DrawMeshProg0 needs (Dark Chronicle).
     bool prog0_meshes = false;

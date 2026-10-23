@@ -35,6 +35,8 @@ namespace {
 std::atomic<uint32_t> g_validation_messages{0};
 // The swapchain or surface must be made again before the next frame.
 std::atomic<bool> g_resize_pending{false};
+// KZ_BINDLESS=1: the bindless array even on a portability-subset device (see PickPhysicalDevice).
+bool g_bindless_forced = false;
 // Set by a game frame's OpenFrame, not by the idle hook's frames.
 std::atomic<bool> g_game_frame_open{false};
 
@@ -391,12 +393,18 @@ void PickPhysicalDevice() {
         kz::Logf(kz::LogLevel::Info, "Vulkan", "portability subset: {}", Join(workarounds));
     }
     std::vector<std::string> bindless_missing = MissingBindless(chosen);
-    // Turning the array off where it works is only for testing, and needs push descriptors.
-    g.bindless = bindless_missing.empty() &&
-                 (g.config.bindless_textures || !HasExtension(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME));
+    // MoltenVK keeps the array in a Metal argument buffer, and a GPU drawing the item models of the
+    // quick loadout's icons from it takes an address fault (Apple A18 Pro); a portability-subset
+    // device therefore pushes each draw's textures, as Metal binds them, unless KZ_BINDLESS=1.
+    // Elsewhere turning the array off where it works is only for testing. Both need push descriptors.
+    const bool portability_pushes = chosen.portability_subset && !g_bindless_forced;
+    g.bindless = bindless_missing.empty() && !((!g.config.bindless_textures || portability_pushes) &&
+                                               HasExtension(chosen, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME));
     if (!g.bindless) {
         kz::Logf(kz::LogLevel::Info, "Vulkan", "each draw pushes its textures: {}",
-                 bindless_missing.empty() ? std::string("bindless textures turned off") : Join(bindless_missing));
+                 !bindless_missing.empty()     ? Join(bindless_missing)
+                 : g.config.bindless_textures ? std::string("portability subset")
+                                              : std::string("bindless textures turned off"));
     }
 }
 
@@ -1129,6 +1137,10 @@ void RendererInit(SDL_Window *window, const RendererConfig &config) {
     if (const char *setting = std::getenv("KZ_BINDLESS"); setting != nullptr && std::strcmp(setting, "0") == 0) {
         g.config.bindless_textures = false;
     }
+    g_bindless_forced = [] {
+        const char *setting = std::getenv("KZ_BINDLESS");
+        return setting != nullptr && std::strcmp(setting, "1") == 0;
+    }();
 #ifdef __ANDROID__
     g.config.render_thread = RenderThreadMode::Off;
 #endif

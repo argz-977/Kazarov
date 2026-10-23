@@ -507,7 +507,9 @@ per stage. GPUs with Metal argument buffers tier 1 (Apple A12 and older) have ab
 there `draw_bound.frag` takes set 0 as one texture, palette and sampler that each draw pushes with
 `vkCmdPushDescriptorSetKHR`, skipped when the previous draw pushed the same. `MissingBindless` makes
 the choice; `RendererConfig::bindless_textures = false` or `KZ_BINDLESS=0` takes the pushed path
-on any device.
+on any device. A portability-subset device (MoltenVK) takes it too even where the array fits: there
+the array is a Metal argument buffer, and drawing the quick loadout's item icons from it faults on
+the GPU (Apple A18 Pro). `KZ_BINDLESS=1` keeps the array on such a device.
 
 Optional, used when present:
 
