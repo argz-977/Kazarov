@@ -335,12 +335,6 @@ std::size_t KzThreadsSnapshot(KzThreadInfo *out, std::size_t max) {
                 info.fp = saved[0x50 / sizeof(std::uintptr_t)];
                 info.pc = saved[0x58 / sizeof(std::uintptr_t)];
             }
-#elif defined(__APPLE__) && defined(__aarch64__)
-            // A suspended context's registers, saved by swapcontext; the running thread's are stale.
-            if (thread.get() != s.running && thread->context.uc.uc_mcontext != nullptr) {
-                info.pc = static_cast<std::uintptr_t>(arm_thread_state64_get_pc(thread->context.uc.uc_mcontext->__ss));
-                info.fp = static_cast<std::uintptr_t>(arm_thread_state64_get_fp(thread->context.uc.uc_mcontext->__ss));
-            }
 #endif
         }
         ++count;
